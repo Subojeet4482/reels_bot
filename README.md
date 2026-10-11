@@ -26,7 +26,7 @@ The website is served by the same server, so it needs no domain approval.
   The "Favs" button (bottom) opens the list: tap = play, trash = remove one, "Remove all" = 2 taps.
   Favorites are stored in the user's browser.
 - Videos that play when the site opens are set in the bot: Admin > Web Start.
-  (If that list is empty, the demo videos inside index.html are used.)
+  (If that list is empty, the site shows nothing. There are no built-in demo videos.)
 - Default videos play first. Key button -> the user creates THEIR OWN 4-digit PIN (typed twice).
   The account id is saved in that browser; next time the key button asks for that PIN.
 - Key button again = back to default. Forgot PIN -> "Create a new one" (a new account).

@@ -36,6 +36,11 @@ svg.i.fill{fill:currentColor;stroke:none}
 #spinner{position:absolute;left:50%;top:50%;width:42px;height:42px;margin:-21px;border-radius:50%;border:3px solid rgba(255,255,255,.2);border-top-color:#fff;animation:spin .8s linear infinite;opacity:0;pointer-events:none;transition:opacity .15s;z-index:2}
 #spinner.on{opacity:1}
 @keyframes spin{to{transform:rotate(360deg)}}
+#boot{position:absolute;inset:0;z-index:50;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:24px;color:#fff;transition:opacity .35s}
+#boot.off{opacity:0;pointer-events:none}
+#boot .bspin{width:54px;height:54px;border-radius:50%;border:4px solid rgba(255,255,255,.18);border-top-color:#fff;animation:spin .9s linear infinite}
+#boot p{margin:0;font-size:18px;font-weight:600}
+#boot small{opacity:.65;font-size:13px;min-height:1em}
 
 /* UI layer */
 #ui{position:absolute;inset:0;pointer-events:none;z-index:3;transition:opacity .2s}
@@ -134,6 +139,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 <body>
 
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8M5 10v10h14V10M10 20v-6h4v6"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3L21 2M16 7l3 3M14 9l2 2"/></symbol>
   <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
   <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
@@ -157,10 +163,12 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 <div id="app">
   <div id="feed" tabindex="0"></div>
   <div id="spinner"></div>
+  <div id="boot"><div class="bspin"></div><p id="bootMsg">Please wait… video load ho raha hai</p><small id="bootSec"></small></div>
 
   <div id="ui">
     <div id="top">
       <div class="topl">
+        <button class="ib" id="homeBtn" aria-label="Home"><svg class="i"><use href="#i-home"/></svg></button>
         <button class="ib" id="lockBtn" aria-label="Lock screen"><svg class="i"><use href="#i-lock"/></svg></button>
         <button class="ib" id="keyBtn" aria-label="Enter PIN"><svg class="i"><use href="#i-key"/></svg></button>
       </div>
@@ -252,6 +260,15 @@ const CATS = {
   let toastT;
   function toast(m){ const t = $('toast'); t.textContent = m; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 2200); }
 
+  /* ---------- First-open loading screen: "Please wait" until the first video plays ---------- */
+  let bootOn = true, bootT0 = Date.now();
+  const bootTick = setInterval(() => { const sec = Math.round((Date.now() - bootT0) / 1000); $('bootSec').textContent = sec >= 3 ? sec + 's' : ''; if (sec >= 8) $('bootMsg').textContent = 'Server start ho raha hai, thoda wait karo…'; }, 1000);
+  const bootMax = setTimeout(() => bootDone(true), 45000);
+  function bootDone(late){
+    if (!bootOn) return; bootOn = false; clearInterval(bootTick); clearTimeout(bootMax);
+    $('boot').classList.add('off'); if (late) toast('Slow connection. Try Home again');
+  }
+
   /* ---------- Feed ---------- */
   const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) activate(+e.target.dataset.i); }), {root:feed, threshold:.65});
   function makeReel(i){
@@ -341,7 +358,7 @@ const CATS = {
   /* video events (captured, since videos are created dynamically) */
   const cur = e => e.target === vid(active);
   feed.addEventListener('waiting', e => { if (cur(e)) $('spinner').classList.add('on'); }, true);
-  ['playing', 'canplay'].forEach(n => feed.addEventListener(n, e => { if (cur(e)){ $('spinner').classList.remove('on'); clearTimeout(wd); } }, true));
+  ['playing', 'canplay'].forEach(n => feed.addEventListener(n, e => { if (cur(e)){ $('spinner').classList.remove('on'); clearTimeout(wd); bootDone(); } }, true));
   feed.addEventListener('loadedmetadata', e => { const v = e.target; v.parentElement.dataset.fit = v.videoHeight > v.videoWidth ? 'cover' : 'contain'; }, true);
   feed.addEventListener('timeupdate', e => {
     if (!cur(e)) return; const v = e.target;
@@ -552,6 +569,7 @@ const CATS = {
         setTimeout(() => { if (token === t && my === searchGen) tryCat(key, my, tries + 1); }, 4000);
         return;
       }
+      if (key === 'random' && my === searchGen){ toast('No videos yet. Loading ' + label(START_CAT) + '…'); selectCat(START_CAT); return; }
       $('spinner').classList.remove('on');
       toast('No videos found for "' + label(key) + '"');
     } catch (e) {
@@ -563,7 +581,7 @@ const CATS = {
   }
 
   /* ---------- Default mode  <->  secret mode ---------- */
-  async function showDefault(){
+  async function showDefault(tries = 0){
     filter = 'default'; exhausted = true;
     $('spinner').classList.add('on');
     let list = [], err = null;
@@ -572,8 +590,11 @@ const CATS = {
       list = shuffle((r.items || []).map(x => ({url:x.url, title:x.title || '', cat:'default'})));   // random order
     } catch (e) { err = e; }
     if (mode !== 'default' || filter !== 'default') return;   // user already went elsewhere
+    if (!list.length && err && err.code === 'network' && bootOn && tries < 25){   // server still waking up: keep waiting
+      setTimeout(() => { if (mode === 'default' && filter === 'default') showDefault(tries + 1); }, 3000); return;
+    }
     if (!list.length){
-      $('spinner').classList.remove('on'); showList([]);
+      bootDone(); $('spinner').classList.remove('on'); showList([]);
       if (err) fail(err); else toast('No start videos');
       return;
     }
@@ -643,6 +664,8 @@ const CATS = {
     }
     pinBusy = false;
   });
+  /* Home: PIN ke baad = sab keywords ke videos ka random mix (har baar / har user ko alag); PIN se pehle = start videos dobara */
+  $('homeBtn').onclick = () => { closeMenu(); closeSearch(); closeFav(); if (mode === 'secret') selectCat('random'); else showDefault(); };
   $('keyBtn').onclick = () => { closeMenu(); if (mode === 'default') openPin(); else exitSecret(); };
   showDefault();
   document.addEventListener('click', e => { if (!menuBtn.contains(e.target)) closeMenu(); });

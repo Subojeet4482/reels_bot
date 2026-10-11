@@ -44,6 +44,7 @@ Web API
   POST /api/feed     {cat,n,exclude} -> random links for keyword `cat` ("random" = mix of all)
                                         {items, reset, searching}
   POST /api/defaults              -> start videos (built-in + Web Start), shuffled
+  POST /api/resolve  {page,force} -> fresh .m3u8 for a saved page url (cached 1 hr)  {url, exp}
 
 SQLite tables (data.db)
   links(id, search, title, url, added)   UNIQUE(search, url)
@@ -101,6 +102,10 @@ LINK_TIMEOUT = 120  # seconds link_file.on_search may run
 ASK_COOLDOWN = 120  # seconds before the same empty keyword is requested again
 MAX_SEARCHING = 5  # keywords link_file may work on at the same time
 MAX_NEW_SEARCH = 10  # new keywords one web user may request per hour
+LINK_TTL = int(os.getenv("LINK_TTL", "3600"))  # seconds: scraped stream links expire after this (1 hr)
+RESOLVE_TIMEOUT = 45  # seconds link_file.resolve_page may run
+TOPUP_EVERY = 600  # seconds: a keyword is topped up in the background at most this often
+MAX_RESOLVE = 30  # fresh stream resolves one web user may trigger per hour
 
 # Videos that play when the website opens (always shuffled). Web Start (admin) adds more.
 DEFAULT_VIDEOS = [
@@ -153,6 +158,7 @@ URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 LEGACY_TITLE_RE = re.compile(r"^(Random|India|Japan|Russia|Cute) #\d+$")
 
 # ---- RAM state. Links are NOT cached: the web reads them straight from SQLite ----
+TOPUP: dict[str, float] = {}  # keyword -> last background top-up time
 SEARCHING: dict[str, float] = {}  # keyword -> start time, while link_file works on it
 LAST_ASK: dict[str, float] = {}  # keyword -> when link_file last finished
 ASKS: dict[str, list[float]] = {}  # web uid -> times of new keyword requests
@@ -267,6 +273,7 @@ def init_db():
                 search TEXT NOT NULL, title TEXT DEFAULT '', url TEXT NOT NULL, added REAL,
                 UNIQUE(search, url));
             CREATE INDEX IF NOT EXISTS links_search ON links(search);
+            CREATE TABLE IF NOT EXISTS resolved(page TEXT PRIMARY KEY, url TEXT NOT NULL, ts REAL);
             CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS tg_users(id INTEGER PRIMARY KEY, data TEXT);
             CREATE TABLE IF NOT EXISTS web_users(uid TEXT PRIMARY KEY, salt TEXT, hash TEXT, created REAL);
@@ -275,9 +282,33 @@ def init_db():
                 hid TEXT PRIMARY KEY, host TEXT, status TEXT, last REAL, count INTEGER DEFAULT 1);
             """
         )
+        if "page" not in [r[1] for r in c.execute("PRAGMA table_info(links)")]:  # old data.db
+            c.execute("ALTER TABLE links ADD COLUMN page TEXT DEFAULT ''")
         c.commit()
     finally:
         c.close()
+
+
+def purge_expired() -> int:
+    """Deletes scraped links + resolve cache older than LINK_TTL. Returns how many links were removed."""
+    cut = time.time() - LINK_TTL
+    n = sql("DELETE FROM links WHERE added < ?", (cut,))
+    sql("DELETE FROM resolved WHERE ts < ?", (cut,))
+    return n
+
+
+def db_get_resolved(page: str):
+    """(url, expires_at) if a stream for this page was resolved less than LINK_TTL-120 s ago, else None."""
+    r = sql("SELECT url, ts FROM resolved WHERE page=?", (page,), "one")
+    if r and time.time() - r["ts"] < LINK_TTL - 120:
+        return r["url"], r["ts"] + LINK_TTL
+    return None
+
+
+def db_set_resolved(page: str, url: str):
+    now = time.time()
+    sql("INSERT OR REPLACE INTO resolved(page, url, ts) VALUES (?,?,?)", (page, url, now))
+    return now + LINK_TTL
 
 
 def kv_get(name: str) -> dict:
@@ -343,21 +374,27 @@ def db_keywords() -> list[dict]:
 
 
 def db_count(kw: str) -> int:
-    return sql("SELECT COUNT(*) AS n FROM links WHERE search=?", (kw,), "one")["n"]
+    return sql("SELECT COUNT(*) AS n FROM links WHERE search=? AND added > ?", (kw, time.time() - LINK_TTL), "one")["n"]
+
+
+def db_needs_topup(kw: str) -> bool:
+    """Same rule as link_file.needs_links: few fresh links, or the newest batch is older than 2/3 of LINK_TTL."""
+    fn = getattr(link_file, "needs_links", None)
+    return bool(fn(kw)) if fn else False
 
 
 def db_pick(kw: str, n: int, exclude: list[int]):
     """n random links for `kw` ("random" = every keyword), never the ids in `exclude`.
     When everything was already seen, starts over (reset=True)."""
     def q(ex):
-        cond, args = [], []
+        cond, args = ["added > ?"], [time.time() - LINK_TTL]  # expired links are never served
         if kw != "random":
             cond.append("search=?")
             args.append(kw)
         if ex:
             cond.append("id NOT IN (" + ",".join(str(i) for i in ex) + ")")
         where = ("WHERE " + " AND ".join(cond)) if cond else ""
-        return sql(f"SELECT id, search, title, url FROM links {where} ORDER BY RANDOM() LIMIT ?", (*args, n), "all")
+        return sql(f"SELECT id, search, title, url, page FROM links {where} ORDER BY RANDOM() LIMIT ?", (*args, n), "all")
 
     rows = q(exclude)
     if rows or not exclude:
@@ -704,6 +741,9 @@ async def api_feed(request):
     exclude = [int(x) for x in ex[:500] if str(x).isdigit()] if isinstance(ex, list) else []
     items, reset = await asyncio.to_thread(db_pick, kw, n, exclude)
     searching = False
+    if items and kw != "random" and time.time() - TOPUP.get(kw, 0) > TOPUP_EVERY and await asyncio.to_thread(db_needs_topup, kw):
+        TOPUP[kw] = time.time()  # links are about to expire: fetch new ones in the background, user keeps watching
+        ask_link_file(request, uid, kw)
     if not items and kw != "random":  # nothing for this keyword yet -> request = "search=<kw>"
         state = ask_link_file(request, uid, kw)
         if state == "limit":
@@ -714,9 +754,57 @@ async def api_feed(request):
             "ok": True,
             "reset": reset,
             "searching": searching,
-            "items": [{"id": x["id"], "url": x["url"], "title": clean_title(x["title"]), "cat": x["search"]} for x in items],
+            "items": [
+                {"id": x["id"], "url": x["url"], "page": x.get("page") or "", "title": clean_title(x["title"]), "cat": x["search"]}
+                for x in items
+            ],
         }
     )
+
+
+RESOLVING: dict[str, asyncio.Lock] = {}  # page -> lock (one yt-dlp run per page at a time)
+RESOLVE_LOG: dict[str, list[float]] = {}  # uid -> times of fresh resolves
+
+
+async def api_resolve(request):
+    """POST {page, force?} -> {url, exp}: fresh .m3u8 for a saved video page (favorites keep only the page url).
+    Result is cached for LINK_TTL (1 hr); exp = epoch ms when it expires."""
+    host, err = await gate(request)
+    if err:
+        return err
+    auth = request.headers.get("Authorization", "")
+    uid = check_token(auth[7:], host) if auth.startswith("Bearer ") else None
+    if not uid:
+        return jerr(401, "bad_token")
+    data = await read_json(request)
+    page = str(data.get("page") or "").strip()[:500]
+    if not link_file or not hasattr(link_file, "resolve_page") or not link_file.allowed_page(page):
+        return jerr(400, "bad_page")
+    force = bool(data.get("force"))
+    if len(RESOLVING) > 500:
+        RESOLVING.clear()
+    async with RESOLVING.setdefault(page, asyncio.Lock()):
+        if not force:
+            hit = await asyncio.to_thread(db_get_resolved, page)
+            if hit:
+                return web.json_response({"ok": True, "url": hit[0], "exp": int(hit[1] * 1000)})
+        now = time.time()
+        RESOLVE_LOG[uid] = [t for t in RESOLVE_LOG.get(uid, []) if now - t < 3600]
+        if len(RESOLVE_LOG[uid]) >= MAX_RESOLVE:
+            return jerr(429, "resolve_limit")
+        RESOLVE_LOG[uid].append(now)
+        try:
+            url = await asyncio.wait_for(asyncio.to_thread(link_file.resolve_page, page), RESOLVE_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("resolve_page timed out: %s", page)
+            url = None
+        except Exception:
+            log.exception("resolve_page failed: %s", page)
+            url = None
+        if not url:
+            return jerr(502, "resolve_failed")
+        exp = await asyncio.to_thread(db_set_resolved, page, url)
+    return web.json_response({"ok": True, "url": url, "exp": int(exp * 1000)})
 
 
 async def api_defaults(request):
@@ -1806,6 +1894,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------ startup
+async def purge_loop():
+    """Every 2 min: scraped links older than LINK_TTL (1 hr) are deleted."""
+    while True:
+        try:
+            n = await asyncio.to_thread(purge_expired)
+            if n:
+                log.info("expired links removed: %d", n)
+        except Exception:
+            log.exception("purge failed")
+        await asyncio.sleep(120)
+
+
 async def post_init(app: Application):
     await asyncio.to_thread(load_all)
 
@@ -1820,8 +1920,10 @@ async def post_init(app: Application):
             web.post("/api/auth", api_auth),
             web.post("/api/feed", api_feed),
             web.post("/api/defaults", api_defaults),
+            web.post("/api/resolve", api_resolve),
         ]
     )
+    app.bot_data["purge"] = asyncio.create_task(purge_loop())
     runner = web.AppRunner(api)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -1830,6 +1932,9 @@ async def post_init(app: Application):
 
 
 async def post_shutdown(app: Application):
+    task = app.bot_data.get("purge")
+    if task:
+        task.cancel()
     runner = app.bot_data.get("runner")
     if runner:
         await runner.cleanup()

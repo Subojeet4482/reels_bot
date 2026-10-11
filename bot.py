@@ -394,6 +394,16 @@ def db_pick(kw: str, n: int, exclude: list[int]):
         if ex:
             cond.append("id NOT IN (" + ",".join(str(i) for i in ex) + ")")
         where = ("WHERE " + " AND ".join(cond)) if cond else ""
+        if kw == "random":  # Home/Random: mix of ALL keywords, one from each keyword in turn (not only the biggest one)
+            try:
+                return sql(
+                    "SELECT id, search, title, url, page FROM (SELECT *, ROW_NUMBER() OVER "
+                    f"(PARTITION BY search ORDER BY RANDOM()) AS rk FROM links {where}) ORDER BY rk, RANDOM() LIMIT ?",
+                    (*args, n),
+                    "all",
+                )
+            except sqlite3.OperationalError:  # very old SQLite without window functions
+                pass
         return sql(f"SELECT id, search, title, url, page FROM links {where} ORDER BY RANDOM() LIMIT ?", (*args, n), "all")
 
     rows = q(exclude)

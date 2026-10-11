@@ -33,6 +33,16 @@ Ready: searches the site (DOMAINS), takes .m3u8 streams with yt-dlp, saves each 
 Settings at the top: TARGET (links per keyword), BUDGET (sec), MAX_PAGES. Empty result = "No videos found".
 DB: data.db, table links(id, search, title, url, added), UNIQUE(search, url).
 
+## Link expiry + Favorites (1 hr)
+- Scraped stream links (.m3u8) expire after LINK_TTL = 3600 s (env LINK_TTL). Bot deletes them every 2 min; expired links are never served.
+  Keyword with no fresh links -> link_file searches again automatically.
+- Each link also stores the video PAGE url (links.page). Favorites save ONLY the page url, never the stream url.
+- Click on a favorite -> POST /api/resolve {page} -> fresh .m3u8 (yt-dlp), cached 1 hr on server (table `resolved`) and in the favorite (browser).
+  If the stream dies early, the player fetches a new one once, automatically.
+- Top-up: when a keyword's newest batch is older than 40 min (or fewer than 5 fresh links), the bot fetches new links in the background
+  (max once per 10 min per keyword, already-fresh videos are skipped) so users never wait for a re-search at the 1 hr mark.
+- Heart + Favs buttons are visible only after PIN; without PIN nothing saved is shown.
+
 ## Bot: admin panel (/start as admin)
 - Link Remove: pick a search keyword -> last 1 / last 50 / all / by number or link (2x confirm).
   (There is no Link Add any more: links come from link_file.py.)

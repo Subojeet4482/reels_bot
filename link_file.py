@@ -44,6 +44,9 @@ DOMAINS = [  # pehla jo chale wahi use hota hai
     "https://xhamster46.desi",
     "https://xhamster.com",
 ]
+LINK_TTL = int(os.getenv("LINK_TTL") or 3600)  # seconds: stream link 1 hr baad expire (bot.py bhi yehi env padhta hai)
+MIN_FRESH = 5  # keyword me itne se kam fresh links ho to naye lao
+REFRESH_AFTER = int(LINK_TTL * 2 / 3)  # keyword ka sabse naya link itna purana ho gaya to purane expire hone se pehle naye lao (top-up)
 TARGET = 20  # ek keyword ke max naye links
 BUDGET = 100  # seconds (bot.py LINK_TIMEOUT = 120 se kam rakho)
 MAX_PAGES = 5  # search pages
@@ -59,27 +62,73 @@ def log(*a):
     print("[link_file]", *a, flush=True)
 
 
+def ensure_schema(con):
+    """Old data.db me `page` column / `resolved` table nahi hota, yahan add ho jata hai."""
+    cols = [r[1] for r in con.execute("PRAGMA table_info(links)")]
+    if cols and "page" not in cols:
+        con.execute("ALTER TABLE links ADD COLUMN page TEXT DEFAULT ''")
+    con.execute("CREATE TABLE IF NOT EXISTS resolved(page TEXT PRIMARY KEY, url TEXT NOT NULL, ts REAL)")
+
+
 def save_links(keyword, links):
-    """links = [(title, url), ...]  ->  table `links`, search=keyword. Returns how many NEW links were saved."""
+    """links = [(title, url) ya (title, url, page_url), ...]  ->  table `links`, search=keyword.
+    page_url = video ka main page (favorites me wahi save hota hai, stream url 1 hr me expire hota hai).
+    Returns how many NEW links were saved."""
     now, added = time.time(), 0
     con = sqlite3.connect(DB_PATH, timeout=30)
     try:
-        for title, url in links:
+        ensure_schema(con)
+        con.execute("DELETE FROM links WHERE added < ?", (now - LINK_TTL,))  # expired links hatao
+        for item in links:
+            title, url = item[0], item[1]
+            page = item[2] if len(item) > 2 else ""
+            if page and con.execute("SELECT 1 FROM links WHERE search=? AND page=?", (keyword, page)).fetchone():
+                continue  # ye video is keyword me abhi fresh hai (top-up me dobara nahi)
             cur = con.execute(
-                "INSERT OR IGNORE INTO links(search, title, url, added) VALUES (?, ?, ?, ?)",
-                (keyword, (title or "")[:120], url, now),
+                "INSERT OR IGNORE INTO links(search, title, url, added, page) VALUES (?, ?, ?, ?, ?)",
+                (keyword, (title or "")[:120], url, now, page or ""),
             )
             added += cur.rowcount
+            if page:  # abhi nikla hua stream = resolve cache (favorite turant chalega)
+                con.execute("INSERT OR REPLACE INTO resolved(page, url, ts) VALUES (?, ?, ?)", (page, url, now))
         con.commit()
     finally:
         con.close()
     return added
 
 
+def needs_links(keyword):
+    """True = keyword ke fresh links kam hain ya sab purane ho rahe hain -> naye scrape karo."""
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        n, newest = con.execute(
+            "SELECT COUNT(*), MAX(added) FROM links WHERE search=? AND added > ?", (keyword, time.time() - LINK_TTL)
+        ).fetchone()
+    except Exception:
+        return True
+    finally:
+        con.close()
+    return n < MIN_FRESH or (newest or 0) < time.time() - REFRESH_AFTER
+
+
+def has_page(keyword, page):
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        return bool(con.execute(
+            "SELECT 1 FROM links WHERE search=? AND page=? AND added > ?", (keyword, page, time.time() - LINK_TTL)
+        ).fetchone())
+    except Exception:
+        return False
+    finally:
+        con.close()
+
+
 def count_links(keyword):
     con = sqlite3.connect(DB_PATH, timeout=30)
     try:
-        return con.execute("SELECT COUNT(*) FROM links WHERE search=?", (keyword,)).fetchone()[0]
+        return con.execute(
+            "SELECT COUNT(*) FROM links WHERE search=? AND added > ?", (keyword, time.time() - LINK_TTL)
+        ).fetchone()[0]
     except Exception:
         return 0
     finally:
@@ -159,8 +208,8 @@ def on_search(keyword):
     if not keyword:
         return
     log(f"request: search={keyword}")
-    if count_links(keyword):
-        log("links already in DB, skipping")
+    if not needs_links(keyword):
+        log("enough fresh links in DB, skipping")
         return
 
     deadline = time.time() + BUDGET
@@ -177,6 +226,8 @@ def on_search(keyword):
         for page_url in video_pages(keyword, deadline):
             if saved >= TARGET or time.time() > deadline:
                 break
+            if has_page(keyword, page_url):  # top-up: ye video already fresh hai, yt-dlp time waste nahi
+                continue
             tried += 1
             try:
                 info = ydl.extract_info(page_url, download=False)
@@ -185,5 +236,47 @@ def on_search(keyword):
                 continue
             m3u8 = best_m3u8(info or {})
             if m3u8:
-                saved += save_links(keyword, [((info.get("title") or ""), m3u8)])
+                saved += save_links(keyword, [((info.get("title") or ""), m3u8, page_url)])
     log(f"search={keyword}: tried {tried} pages, saved {saved} links")
+
+
+def allowed_page(url):
+    """Sirf apne DOMAINS ke https video pages resolve hote hain (koi bhi random url nahi)."""
+    try:
+        u = urllib.parse.urlparse(url or "")
+    except Exception:
+        return False
+    if u.scheme != "https" or not u.hostname or "/videos/" not in u.path:
+        return False
+    host = u.hostname.lower()
+    for d in DOMAINS:
+        dh = urllib.parse.urlparse(d).hostname
+        if dh and (host == dh or host.endswith("." + dh)):
+            return True
+    return False
+
+
+def resolve_page(page_url):
+    """Video page url -> naya .m3u8 stream url (None agar nahi mila). Bot /api/resolve me thread me chalata hai."""
+    if not allowed_page(page_url):
+        return None
+    try:
+        import yt_dlp
+    except ImportError:
+        log("yt-dlp is not installed")
+        return None
+    opts = {
+        "format": "best[protocol^=m3u8]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 15,
+        "extractor_retries": 1,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(page_url, download=False)
+        return best_m3u8(info or {})
+    except Exception as e:
+        log("resolve failed", page_url, str(e)[:80])
+        return None

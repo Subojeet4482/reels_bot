@@ -30,8 +30,17 @@ Polling needs an always-on process: Render / Railway / VPS (NOT Vercel).
 
 ## link_file.py
 Ready: searches the site (DOMAINS), takes .m3u8 streams with yt-dlp, saves each link as found.
-Settings at the top: TARGET (links per keyword), BUDGET (sec), MAX_PAGES. Empty result = "No videos found".
+Settings at the top: TARGET (links per keyword), BUDGET (sec), QUERY_SUFFIX ("india" -> "india popular video"), PAGES_PER_SEARCH (random result pages per search). Empty result = "No videos found".
 DB: data.db, table links(id, search, title, url, added), UNIQUE(search, url).
+
+## Search = "<keyword> popular video", random pages, Home
+- India / Japan / Russia / Cute (and any typed keyword) are searched on the site as "<keyword> popular video" (QUERY_SUFFIX in link_file.py).
+  If that gives nothing, the plain keyword is tried. The DB keyword stays "india", "japan" ...
+- Every search reads the site's total page count and picks PAGES_PER_SEARCH (6) RANDOM pages out of ALL pages (cap PAGE_CAP = 40),
+  mixes videos across those pages (one from each page in turn) -> different videos every time, not always the top page.
+- Home button (top left): after PIN = random mix of ALL keywords (one from each keyword in turn, new random pick every time / for every user);
+  before PIN = start videos again. Next/scroll keeps picking new random videos.
+- First open: "Please wait" screen until the first video plays (if the server is still waking up it keeps retrying, max 45 s).
 
 ## Link expiry + Favorites (1 hr)
 - Scraped stream links (.m3u8) expire after LINK_TTL = 3600 s (env LINK_TTL). Bot deletes them every 2 min; expired links are never served.

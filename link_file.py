@@ -25,13 +25,14 @@ Har link milte hi save hota hai, isliye pehla video kuch second mein website par
 ==================================================================================
 3) YE FILE KYA KARTI HAI
 ==================================================================================
-keyword -> site ka search page (kuch pages) -> video pages -> yt-dlp se .m3u8 stream -> save_links()
+keyword -> "<keyword> popular video" search -> RANDOM result pages (1..total) -> video pages -> yt-dlp se .m3u8 stream -> save_links()
  - sirf .m3u8 save hote hain (mp4 player mein nahi chalta)
  - random / unrelated fallback NAHI: kuch nahi mila to keyword khali rehta hai ("No videos found")
  - time budget: BUDGET sec ke baad apne aap ruk jata hai (bot ke 120 sec timeout se pehle)
-Settings niche hain: DOMAINS, TARGET, BUDGET, MAX_PAGES.
+Settings niche hain: DOMAINS, TARGET, BUDGET, QUERY_SUFFIX, PAGES_PER_SEARCH.
 """
 import os
+import random
 import re
 import sqlite3
 import time
@@ -49,7 +50,10 @@ MIN_FRESH = 5  # keyword me itne se kam fresh links ho to naye lao
 REFRESH_AFTER = int(LINK_TTL * 2 / 3)  # keyword ka sabse naya link itna purana ho gaya to purane expire hone se pehle naye lao (top-up)
 TARGET = 20  # ek keyword ke max naye links
 BUDGET = 100  # seconds (bot.py LINK_TIMEOUT = 120 se kam rakho)
-MAX_PAGES = 5  # search pages
+QUERY_SUFFIX = " popular video"  # "india" -> site par "india popular video" search hota hai (DB me keyword "india" hi rehta hai)
+PAGES_PER_SEARCH = 6  # ek search me itne RANDOM result pages uthao (1..total me se) -> har baar alag videos
+DEFAULT_TOTAL_PAGES = 10  # agar site se total pages na mile to itne maano
+PAGE_CAP = 40  # random page kabhi isse upar nahi (site deep pages block kar sakti hai)
 PAGE_PAUSE = 1.0  # seconds between page requests (block hone se bachne ke liye)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -143,42 +147,78 @@ def fetch(url, timeout=12):
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def video_pages(query, deadline):
-    """Yields video page URLs from the site's search results (page by page, no duplicates)."""
-    q = urllib.parse.quote_plus(query.strip())
-    base, first = None, None
-    for d in DOMAINS:  # first domain that answers
-        try:
-            first = fetch(f"{d}/search/{q}")
-            base = d
-            break
-        except Exception as e:
-            log("domain failed:", d, e)
-    if not base:
+def search_query(keyword):
+    """'india' -> 'india popular video'. Jo keyword already 'video(s)' pe khatam ho use waise hi rehne do."""
+    k = re.sub(r"\s+", " ", (keyword or "").strip().lower())
+    return k if re.search(r"\bvideos?$", k) else k + QUERY_SUFFIX
+
+
+def total_pages(html):
+    """Search page ke pagination se sabse bada page number (nahi mila to None)."""
+    nums = [int(n) for n in re.findall(r"[?&]page=(\d{1,4})", html)]
+    return max(nums) if nums else None
+
+
+def page_videos(html, base, host):
+    out, seen = [], set()
+    for href in re.findall(r'href="((?:https?://[^"/]+)?/videos/[^"#?]+)"', html):
+        u = urllib.parse.urljoin(base + "/", href)
+        if urllib.parse.urlparse(u).netloc == host and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def video_pages(keyword, deadline):
+    """Yields video page URLs from RANDOM search-result pages (1..total), mixed across pages, no duplicates.
+    Pehle 'india popular video' search hota hai; kuch na mile to sirf 'india'."""
+    queries = [search_query(keyword)]
+    plain = (keyword or "").strip().lower()
+    if plain and plain != queries[0]:
+        queries.append(plain)
+    for query in queries:
+        q = urllib.parse.quote_plus(query)
+        base, first = None, None
+        for d in DOMAINS:  # first domain that answers
+            try:
+                first = fetch(f"{d}/search/{q}")
+                base = d
+                break
+            except Exception as e:
+                log("domain failed:", d, e)
+        if not base:
+            return
+        host = urllib.parse.urlparse(base).netloc
+        first_vids = page_videos(first, base, host)
+        if not first_vids:
+            continue  # is query ka result nahi -> agla query
+        total = min(total_pages(first) or DEFAULT_TOTAL_PAGES, PAGE_CAP)
+        picks = random.sample(range(1, total + 1), min(PAGES_PER_SEARCH, total))
+        log(f'query="{query}" total_pages={total} picked={sorted(picks)}')
+        pools, seen = [], set()
+        for page in picks:
+            if time.time() > deadline:
+                break
+            try:
+                vids = first_vids if page == 1 else page_videos(fetch(f"{base}/search/{q}?page={page}"), base, host)
+            except Exception as e:
+                log("page", page, "failed:", e)
+                continue
+            vids = [u for u in vids if u not in seen]
+            seen.update(vids)
+            random.shuffle(vids)
+            if vids:
+                pools.append(vids)
+            if page != 1:
+                time.sleep(PAGE_PAUSE)
+        if not pools and first_vids:  # random pages fail hue -> page 1 se kaam chalao
+            pools = [random.sample(first_vids, len(first_vids))]
+        random.shuffle(pools)
+        while any(pools):  # round-robin: har page se ek-ek video, taaki sab pages ke videos mix hon
+            for pool in pools:
+                if pool:
+                    yield pool.pop()
         return
-    host = urllib.parse.urlparse(base).netloc
-    seen, prev_sig = set(), None
-    for page in range(1, MAX_PAGES + 1):
-        if time.time() > deadline:
-            return
-        try:
-            html = first if page == 1 else fetch(f"{base}/search/{q}?page={page}")
-        except Exception as e:
-            log("page", page, "failed:", e)
-            return
-        found = []
-        for href in re.findall(r'href="((?:https?://[^"/]+)?/videos/[^"#?]+)"', html):
-            u = urllib.parse.urljoin(base + "/", href)
-            if urllib.parse.urlparse(u).netloc == host and u not in seen:
-                seen.add(u)
-                found.append(u)
-        sig = tuple(found[:5])
-        if not found or sig == prev_sig:  # empty page or same as before = end of results
-            return
-        prev_sig = sig
-        for u in found:
-            yield u
-        time.sleep(PAGE_PAUSE)
 
 
 def best_m3u8(info):

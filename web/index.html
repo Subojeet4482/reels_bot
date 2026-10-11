@@ -217,15 +217,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 // that domain then has to be approved in the bot (Request).
 const API_BASE = '';
 
-/* Videos shown before the PIN is entered. Put your own default .m3u8 links here. */
-const DEFAULTS = [
-  'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
-  'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8',
-  'https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8',
-  'https://bitdash-a.akamaihd.net/content/sintel/hls/playlist.m3u8',
-  'https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8',
-  'https://test-streams.mux.dev/test_001/stream.m3u8'
-];
+/* Videos shown before the PIN is entered are set in the bot: Admin > Web Start. */
 
 /* Menu entries. Keys must match the bot (Firestore collection names); 'random' = mix of all. */
 const CATS = {
@@ -241,7 +233,7 @@ const CATS = {
   const $ = id => document.getElementById(id);
   const app = $('app'), feed = $('feed'), menu = $('menu');
   const icon = (el, n) => el.firstElementChild.setAttribute('href', '#i-' + n);
-  let reels = [], active = -1, hls = null, muted = true, zoom = 1;
+  let reels = [], active = -1, hls = null, muted = true, zoom = 1, wd = null;
   const vid = i => reels[i] && reels[i].querySelector('video');
 
   let toastT;
@@ -259,6 +251,7 @@ const CATS = {
   function release(i){
     const v = vid(i); if (!v) return;
     v.pause();
+    clearTimeout(wd);
     if (hls){ hls.destroy(); hls = null; }
     v.removeAttribute('src'); v.load();
   }
@@ -272,17 +265,31 @@ const CATS = {
     load(vid(i), STREAMS[i].url);
   }
   function play(v){ const p = v.play(); if (p && p.catch) p.catch(() => toast('Tap to play')); }
+  function failStream(my, msg){          // dead / blocked link: say why, then go to the next video
+    if (active !== my) return;
+    clearTimeout(wd); $('spinner').classList.remove('on'); toast(msg);
+    const n = my + 1;
+    if (n < reels.length) setTimeout(() => { if (active === my) feed.scrollTo({top:n * feed.clientHeight, behavior:'smooth'}); }, 1500);
+  }
   function load(v, url){
+    const my = active; let tries = 0;
     $('spinner').classList.add('on'); setProg(0); $('tCur').textContent = '0:00';
     v.muted = muted;
+    clearTimeout(wd);
+    wd = setTimeout(() => { if (active === my && v.paused && v.readyState < 3) failStream(my, 'Stream is too slow or blocked'); }, 20000);
     if (window.Hls && Hls.isSupported()){
-      hls = new Hls(); hls.loadSource(url); hls.attachMedia(v);
+      hls = new Hls({manifestLoadingMaxRetry:1, levelLoadingMaxRetry:2, fragLoadingMaxRetry:3});
+      hls.loadSource(url); hls.attachMedia(v);
       hls.on(Hls.Events.MANIFEST_PARSED, () => play(v));
       hls.on(Hls.Events.ERROR, (e, d) => {
         if (!d.fatal) return;
-        if (d.type === Hls.ErrorTypes.NETWORK_ERROR){ toast('Network problem. Retrying…'); hls.startLoad(); }
-        else if (d.type === Hls.ErrorTypes.MEDIA_ERROR){ hls.recoverMediaError(); }
-        else { $('spinner').classList.remove('on'); toast('This stream cannot be played'); }
+        if (d.type === Hls.ErrorTypes.NETWORK_ERROR){
+          if (++tries <= 2){ toast('Network problem. Retrying…'); hls.startLoad(); return; }
+          const c = d.response && d.response.code;
+          failStream(my, c ? 'Link error (HTTP ' + c + ')' : 'Link blocked or offline');
+        }
+        else if (d.type === Hls.ErrorTypes.MEDIA_ERROR){ if (++tries <= 2) hls.recoverMediaError(); else failStream(my, 'This video cannot be played'); }
+        else failStream(my, 'This stream cannot be played');
       });
     } else if (v.canPlayType('application/vnd.apple.mpegurl')){
       v.src = url; v.addEventListener('loadedmetadata', () => play(v), {once:true});
@@ -292,7 +299,7 @@ const CATS = {
   /* video events (captured, since videos are created dynamically) */
   const cur = e => e.target === vid(active);
   feed.addEventListener('waiting', e => { if (cur(e)) $('spinner').classList.add('on'); }, true);
-  ['playing', 'canplay'].forEach(n => feed.addEventListener(n, e => { if (cur(e)) $('spinner').classList.remove('on'); }, true));
+  ['playing', 'canplay'].forEach(n => feed.addEventListener(n, e => { if (cur(e)){ $('spinner').classList.remove('on'); clearTimeout(wd); } }, true));
   feed.addEventListener('loadedmetadata', e => { const v = e.target; v.parentElement.dataset.fit = v.videoHeight > v.videoWidth ? 'cover' : 'contain'; }, true);
   feed.addEventListener('timeupdate', e => {
     if (!cur(e)) return; const v = e.target;
@@ -496,13 +503,17 @@ const CATS = {
   async function showDefault(){
     filter = 'default'; exhausted = true;
     $('spinner').classList.add('on');
-    let list = null;
+    let list = [], err = null;
     try {
       const r = await api('/api/defaults', {});          // set by the admin in the bot > Web Start
-      if (r.items && r.items.length) list = r.items.map(x => ({url:x.url, title:x.title || '', cat:'default'}));
-    } catch (e) {}
+      list = (r.items || []).map(x => ({url:x.url, title:x.title || '', cat:'default'}));
+    } catch (e) { err = e; }
     if (mode !== 'default' || filter !== 'default') return;   // user already went elsewhere
-    if (!list) list = shuffle(DEFAULTS.map(url => ({url, title:'', cat:'default'})));
+    if (!list.length){
+      $('spinner').classList.remove('on'); showList([]);
+      if (err) fail(err); else toast('No start videos yet. Admin: bot > Web Start');
+      return;
+    }
     showList(list);
   }
   function enterSecret(){

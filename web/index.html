@@ -68,7 +68,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 
 #rail{position:absolute;z-index:2;left:calc(18px + var(--sl));right:calc(18px + var(--sr));bottom:calc(18px + var(--sb));display:flex;flex-direction:row;justify-content:space-between;align-items:flex-end}
 .rb{display:flex;flex-direction:column;align-items:center;gap:3px;background:none;border:0;padding:0;cursor:pointer;font-size:11px;font-weight:700;text-shadow:0 1px 6px rgba(0,0,0,.7)}
-.rb .c{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;background:var(--glass);border:1px solid var(--line);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:transform .1s,color .15s}
+.rb .c{position:relative;width:48px;height:48px;border-radius:50%;display:grid;place-items:center;background:var(--glass);border:1px solid var(--line);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:transform .1s,color .15s}
 .rb:active .c{transform:scale(.88)}
 
 
@@ -95,19 +95,37 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 #toast.on{opacity:1;transform:translate(-50%,0)}
 
 /* Add-link sheet */
-#sheet,#pinSheet{position:absolute;inset:0;z-index:7;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;opacity:0;visibility:hidden;transition:.2s}
-#sheet.on,#pinSheet.on{opacity:1;visibility:visible}
+#favSheet,#pinSheet{position:absolute;inset:0;z-index:7;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;opacity:0;visibility:hidden;transition:.2s}
+#favSheet.on,#pinSheet.on{opacity:1;visibility:visible}
 .card{width:100%;padding:18px 16px calc(18px + var(--sb));background:#151a26;border-radius:22px 22px 0 0;transform:translateY(30px);transition:transform .2s}
-#sheet.on .card,#pinSheet.on .card{transform:none}
+#favSheet.on .card,#pinSheet.on .card{transform:none}
 .card h2{margin:0 0 4px;font-size:18px}
 .card p{margin:0 0 14px;font-size:13px;color:#8a93a8}
-.row{display:flex;gap:8px}
-.row input{flex:1;min-width:0;height:48px;padding:0 14px;border-radius:12px;border:1px solid var(--line);background:#0b0e14;color:#fff;font:inherit;font-size:14px}
 #pinInput{width:100%;height:56px;text-align:center;font-size:28px;letter-spacing:.6em;padding-left:.6em;border-radius:12px;border:1px solid var(--line);background:#0b0e14;color:#fff;font-family:inherit;margin-bottom:10px}
 #pinInput.shake{animation:shake .35s}
 @keyframes shake{20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
 .ghost{width:100%;height:44px;border:0;border-radius:12px;background:rgba(255,255,255,.08);font-weight:700;cursor:pointer}
-.row button{height:48px;padding:0 20px;border:0;border-radius:12px;background:var(--accent);color:var(--ink);font-weight:800;cursor:pointer}
+
+/* Favorites */
+#favBtn.on{color:var(--heart);border-color:var(--heart)}
+#favBtn.on svg{fill:currentColor}
+#favBtn.pop{animation:pop .3s}
+@keyframes pop{40%{transform:scale(1.25)}}
+.badge{position:absolute;top:-5px;right:-5px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:var(--heart);color:#fff;font-size:11px;font-weight:800;display:grid;place-items:center;border:2px solid #000;text-shadow:none}
+.fhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+.fhead h2{margin:0}
+#favCount{font-size:13px;color:var(--heart);margin-left:6px;font-weight:800}
+#favList{list-style:none;margin:0 0 12px;padding:0;max-height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+#favList li{display:flex;align-items:center;background:#0b0e14;border:1px solid var(--line);border-radius:12px}
+#favList li.empty{justify-content:center;padding:20px 12px;color:#8a93a8;font-size:13px;text-align:center;border:0;background:none}
+.fplay{flex:1;min-width:0;display:flex;align-items:center;gap:10px;padding:10px 12px;background:none;border:0;text-align:left;cursor:pointer}
+.fn{flex:none;width:26px;height:26px;border-radius:50%;background:rgba(255,255,255,.08);display:grid;place-items:center;font-size:12px;font-weight:800}
+.ft{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:600}
+.fdel{flex:none;width:46px;height:46px;border:0;background:none;color:#ff6b86;cursor:pointer;display:grid;place-items:center}
+.frow{display:flex;gap:8px}
+.frow .ghost{flex:1}
+.ghost.danger{color:#ff6b86}
+.ghost.sm{width:auto;height:36px;padding:0 14px}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
@@ -129,6 +147,8 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
   <symbol id="i-share" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></symbol>
   <symbol id="i-vol" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></symbol>
   <symbol id="i-mute" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M23 9l-6 6M17 9l6 6"/></symbol>
+  <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4V3z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 10v7M14 10v7"/></symbol>
 </svg>
 
 <div id="app">
@@ -143,7 +163,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       </div>
       <div id="brand"></div>
       <div class="topr">
-        <button class="ib" id="addBtn" aria-label="Add stream link"><svg class="i"><use href="#i-plus"/></svg></button>
+        <button class="ib" id="favBtn" aria-label="Add to favorites" aria-pressed="false"><svg class="i" id="favIcon"><use href="#i-heart"/></svg></button>
         <div class="menu-wrap" id="menuWrap" hidden>
           <button class="ib" id="menuBtn" aria-label="Open menu" aria-expanded="false"><svg class="i"><use href="#i-list"/></svg></button>
           <ul id="menu" role="menu"></ul>
@@ -161,6 +181,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     <div id="rail">
       <button class="rb" id="muteBtn" aria-label="Sound"><span class="c"><svg class="i" id="muteIcon"><use href="#i-mute"/></svg></span>Sound</button>
       <button class="rb" id="rotateBtn" aria-label="Landscape"><span class="c"><svg class="i" id="rotIcon"><use href="#i-rotate"/></svg></span><span id="rotLabel">Rotate</span></button>
+      <button class="rb" id="favsBtn" aria-label="Open favorites"><span class="c"><svg class="i"><use href="#i-bookmark"/></svg><b class="badge" id="favBadge" hidden>0</b></span>Favs</button>
       <button class="rb" id="nextBtn" aria-label="Next reel"><span class="c"><svg class="i"><use href="#i-down"/></svg></span>Next</button>
     </div>
     <div id="scrub" aria-label="Seek">
@@ -169,9 +190,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     </div>
   </div>
 
-  <div id="sheet"><div class="card">
-    <h2>Add a stream</h2><p>Paste a public .m3u8 link. It becomes the last reel.</p>
-    <div class="row"><input id="urlInput" type="url" inputmode="url" placeholder="https://…/stream.m3u8" aria-label="HLS stream URL"><button id="goBtn">Add</button></div>
+  <div id="favSheet"><div class="card">
+    <div class="fhead"><h2>Favorites<span id="favCount">0/50</span></h2><button class="ghost sm" id="favClose">Close</button></div>
+    <p>Tap the heart on any video to save it. Max 50.</p>
+    <ul id="favList"></ul>
+    <div class="frow"><button class="ghost" id="favExit" hidden>Exit favorites</button><button class="ghost danger" id="favClear" hidden>Remove all</button></div>
   </div></div>
 
   <div id="pinSheet"><div class="card">
@@ -245,7 +268,7 @@ const CATS = {
     active = i;
     reels[i].classList.remove('off'); scrub.classList.remove('open');
     if (i >= STREAMS.length - 2) loadMore();
-    $('brand').textContent = STREAMS[i].title || '';
+    $('brand').textContent = STREAMS[i].title || ''; updateFavUI();
     load(vid(i), STREAMS[i].url);
   }
   function play(v){ const p = v.play(); if (p && p.catch) p.catch(() => toast('Tap to play')); }
@@ -318,20 +341,67 @@ const CATS = {
   });
   new ResizeObserver(() => { if (active >= 0){ feed.style.scrollBehavior = 'auto'; feed.scrollTop = active * feed.clientHeight; } }).observe(feed);
 
-  /* ---------- Add link ---------- */
-  const sheet = $('sheet');
-  $('addBtn').onclick = () => { sheet.classList.add('on'); setTimeout(() => $('urlInput').focus(), 200); };
-  sheet.addEventListener('click', e => { if (e.target === sheet) sheet.classList.remove('on'); });
-  function add(){
-    const v = $('urlInput').value.trim();
-    if (!/^https?:\/\//i.test(v)){ toast('Enter a valid http(s) link'); return; }
-    STREAMS.push({url:v, cat:'local'}); seen.add(v);
-    makeReel(STREAMS.length - 1);
-    $('urlInput').value = ''; sheet.classList.remove('on');
-    feed.style.scrollBehavior = ''; goTo(reels.length - 1);
+  /* ---------- Favorites (max 50, saved in this browser) ---------- */
+  const FAV_MAX = 50;
+  let favs = [], memFavs = null, prevFilter = 'random', clearT;
+  try { const j = JSON.parse(localStorage.getItem('favs') || '[]'); if (Array.isArray(j)) favs = j.filter(f => f && typeof f.url === 'string').slice(0, FAV_MAX); } catch (e) {}
+  const esc = t => String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const favLabel = f => { if (f.title) return f.title; try { const u = new URL(f.url); return (u.host + u.pathname).slice(0, 60); } catch (e) { return f.url.slice(0, 60); } };
+  const isFav = url => favs.some(f => f.url === url);
+  function saveFavs(){ memFavs = favs; try { localStorage.setItem('favs', JSON.stringify(favs)); } catch (e) {} updateFavUI(); }
+  function updateFavUI(){
+    const s = STREAMS[active], on = !!(s && isFav(s.url)), b = $('favBtn');
+    b.classList.toggle('on', on); b.setAttribute('aria-pressed', on);
+    b.setAttribute('aria-label', on ? 'Remove from favorites' : 'Add to favorites');
+    $('favIcon').classList.toggle('fill', on);
+    $('favBadge').textContent = favs.length; $('favBadge').hidden = !favs.length;
+    $('favCount').textContent = favs.length + '/' + FAV_MAX;
   }
-  $('goBtn').onclick = add;
-  $('urlInput').addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  $('favBtn').onclick = () => {
+    const s = STREAMS[active]; if (!s){ toast('Nothing to save yet'); return; }
+    const i = favs.findIndex(f => f.url === s.url);
+    if (i >= 0){ favs.splice(i, 1); toast('Removed from favorites'); }
+    else {
+      if (favs.length >= FAV_MAX){ toast('Favorites full (' + FAV_MAX + '/' + FAV_MAX + '). Remove one first'); return; }
+      favs.push({url:s.url, title:s.title || '', cat:s.cat || ''}); toast('Saved to favorites (' + favs.length + '/' + FAV_MAX + ')');
+    }
+    saveFavs();
+    const b = $('favBtn'); b.classList.remove('pop'); void b.offsetWidth; b.classList.add('pop');
+  };
+
+  const favSheet = $('favSheet');
+  function renderFavs(){
+    $('favList').innerHTML = favs.length
+      ? favs.map((f, i) => '<li><button class="fplay" data-play="' + i + '"><span class="fn">' + (i + 1) + '</span><span class="ft">' + esc(favLabel(f)) + '</span></button><button class="fdel" data-del="' + i + '" aria-label="Remove from favorites"><svg class="i"><use href="#i-trash"/></svg></button></li>').join('')
+      : '<li class="empty">No favorites yet. Tap the heart on a video to save it.</li>';
+    $('favClear').hidden = !favs.length; $('favClear').textContent = 'Remove all';
+    $('favExit').hidden = filter !== 'favs';
+    updateFavUI();
+  }
+  const openFav = () => { renderFavs(); favSheet.classList.add('on'); };
+  const closeFav = () => favSheet.classList.remove('on');
+  $('favsBtn').onclick = openFav;
+  $('favClose').onclick = closeFav;
+  favSheet.addEventListener('click', e => { if (e.target === favSheet) closeFav(); });
+  $('favList').addEventListener('click', e => {
+    const d = e.target.closest('[data-del]'), p = e.target.closest('[data-play]');
+    if (d){ favs.splice(+d.dataset.del, 1); saveFavs(); renderFavs(); }
+    else if (p) playFavs(+p.dataset.play);
+  });
+  $('favClear').onclick = () => {      // two taps: confirm
+    const b = $('favClear');
+    if (b.dataset.sure){ delete b.dataset.sure; clearTimeout(clearT); favs = []; saveFavs(); renderFavs(); toast('All favorites removed'); return; }
+    b.dataset.sure = '1'; b.textContent = 'Tap again to remove all';
+    clearT = setTimeout(() => { delete b.dataset.sure; b.textContent = 'Remove all'; }, 3000);
+  };
+  function playFavs(i){
+    closeFav(); if (filter !== 'favs') prevFilter = filter;
+    filter = 'favs'; exhausted = true;
+    [...menu.children].forEach(li => li.classList.remove('on'));
+    showList(favs.map(f => ({url:f.url, title:f.title, cat:'fav'})));
+    if (i > 0) feed.scrollTop = i * feed.clientHeight;
+  }
+  $('favExit').onclick = () => { closeFav(); if (mode === 'secret') selectCat(CATS[prevFilter] ? prevFilter : 'random'); else showDefault(); };
 
   /* ---------- Zoom 0.5x – 3x ---------- */
   function setZoom(z){
@@ -384,7 +454,7 @@ const CATS = {
   function showList(list){
     if (active >= 0) release(active);
     active = -1; reels = []; feed.innerHTML = ''; STREAMS = list; seen = new Set(list.map(x => x.id).filter(Boolean));
-    $('brand').textContent = '';
+    $('brand').textContent = ''; updateFavUI();
     list.forEach((_, i) => makeReel(i));
     feed.style.scrollBehavior = 'auto'; feed.scrollTop = 0;
   }
@@ -423,9 +493,17 @@ const CATS = {
   }
 
   /* ---------- Default mode  <->  secret mode ---------- */
-  function showDefault(){
+  async function showDefault(){
     filter = 'default'; exhausted = true;
-    showList(shuffle(DEFAULTS.map(url => ({url, title:'', cat:'default'}))));
+    $('spinner').classList.add('on');
+    let list = null;
+    try {
+      const r = await api('/api/defaults', {});          // set by the admin in the bot > Web Start
+      if (r.items && r.items.length) list = r.items.map(x => ({url:x.url, title:x.title || '', cat:'default'}));
+    } catch (e) {}
+    if (mode !== 'default' || filter !== 'default') return;   // user already went elsewhere
+    if (!list) list = shuffle(DEFAULTS.map(url => ({url, title:'', cat:'default'})));
+    showList(list);
   }
   function enterSecret(){
     mode = 'secret';

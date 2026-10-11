@@ -50,7 +50,7 @@ svg.i.fill{fill:currentColor;stroke:none}
 button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 #top{position:absolute;z-index:2;top:calc(10px + var(--st));left:calc(10px + var(--sl));right:calc(10px + var(--sr));display:flex;align-items:center;justify-content:space-between}
-#brand{position:absolute;left:50%;transform:translateX(-50%);max-width:calc(100% - 230px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;pointer-events:none;font-weight:800;font-size:16px;letter-spacing:-.01em;text-shadow:0 1px 8px rgba(0,0,0,.5)}
+#brand{position:absolute;left:50%;transform:translateX(-50%);max-width:calc(100% - 330px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;pointer-events:none;font-weight:800;font-size:16px;letter-spacing:-.01em;text-shadow:0 1px 8px rgba(0,0,0,.5)}
 .topl{display:flex;gap:8px}
 #keyBtn.on{color:var(--accent);border-color:var(--accent)}
 .topr{display:flex;gap:8px}
@@ -95,15 +95,17 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 #toast.on{opacity:1;transform:translate(-50%,0)}
 
 /* Add-link sheet */
-#favSheet,#pinSheet{position:absolute;inset:0;z-index:7;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;opacity:0;visibility:hidden;transition:.2s}
-#favSheet.on,#pinSheet.on{opacity:1;visibility:visible}
+#favSheet,#pinSheet,#searchSheet{position:absolute;inset:0;z-index:7;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;opacity:0;visibility:hidden;transition:.2s}
+#favSheet.on,#pinSheet.on,#searchSheet.on{opacity:1;visibility:visible}
 .card{width:100%;padding:18px 16px calc(18px + var(--sb));background:#151a26;border-radius:22px 22px 0 0;transform:translateY(30px);transition:transform .2s}
-#favSheet.on .card,#pinSheet.on .card{transform:none}
+#favSheet.on .card,#pinSheet.on .card,#searchSheet.on .card{transform:none}
 .card h2{margin:0 0 4px;font-size:18px}
 .card p{margin:0 0 14px;font-size:13px;color:#8a93a8}
 #pinInput{width:100%;height:56px;text-align:center;font-size:28px;letter-spacing:.6em;padding-left:.6em;border-radius:12px;border:1px solid var(--line);background:#0b0e14;color:#fff;font-family:inherit;margin-bottom:10px}
 #pinInput.shake{animation:shake .35s}
 @keyframes shake{20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
+#searchInput{width:100%;height:52px;padding:0 16px;font-size:18px;border-radius:12px;border:1px solid var(--line);background:#0b0e14;color:#fff;font-family:inherit;margin-bottom:10px}
+.ghost.go{background:var(--accent);color:#07080b;margin-bottom:8px}
 .ghost{width:100%;height:44px;border:0;border-radius:12px;background:rgba(255,255,255,.08);font-weight:700;cursor:pointer}
 
 /* Favorites */
@@ -136,6 +138,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
   <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
   <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
   <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
   <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
   <symbol id="i-rotate" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></symbol>
@@ -164,6 +167,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       <div id="brand"></div>
       <div class="topr">
         <button class="ib" id="favBtn" aria-label="Add to favorites" aria-pressed="false"><svg class="i" id="favIcon"><use href="#i-heart"/></svg></button>
+        <button class="ib" id="searchBtn" aria-label="Search" hidden><svg class="i"><use href="#i-search"/></svg></button>
         <div class="menu-wrap" id="menuWrap" hidden>
           <button class="ib" id="menuBtn" aria-label="Open menu" aria-expanded="false"><svg class="i"><use href="#i-list"/></svg></button>
           <ul id="menu" role="menu"></ul>
@@ -204,6 +208,13 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     <button class="ghost" id="pinCancel">Cancel</button>
   </div></div>
 
+  <div id="searchSheet"><div class="card">
+    <h2>Search</h2><p>Type any keyword, e.g. india, japan, cricket</p>
+    <input id="searchInput" type="search" maxlength="40" autocomplete="off" autocapitalize="none" enterkeyhint="search" placeholder="Search videos" aria-label="Search keyword">
+    <button class="ghost go" id="searchGo">Search</button>
+    <button class="ghost" id="searchCancel">Cancel</button>
+  </div></div>
+
   <div id="toast"></div>
   <div id="lockOverlay"></div>
   <button class="ib" id="unlockBtn" aria-label="Unlock screen"><svg class="i"><use href="#i-unlock"/></svg>Unlock</button>
@@ -217,15 +228,17 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 // that domain then has to be approved in the bot (Request).
 const API_BASE = '';
 
-/* Videos shown before the PIN is entered are set in the bot: Admin > Web Start. */
+/* Videos shown before the PIN is entered: built-in list in bot.py (DEFAULT_VIDEOS) + Admin > Web Start, random order. */
 
-/* Menu entries. Keys must match the bot (Firestore collection names); 'random' = mix of all. */
+/* Menu entries. The key IS the search keyword sent to the bot (search=india ...); 'random' = mix of all.
+   Users can also type any keyword in the search box. */
+const START_CAT = 'india';
 const CATS = {
-  random:       {label:'Random', emoji:'🎲'},
-  India_video:  {label:'India',  emoji:'🇮🇳'},
-  Japan_video:  {label:'Japan',  emoji:'🇯🇵'},
-  Russia_video: {label:'Russia', emoji:'🇷🇺'},
-  Cute_video:   {label:'Cute',   emoji:'🥰'}
+  random: {label:'Random', emoji:'🎲'},
+  india:  {label:'India',  emoji:'🇮🇳'},
+  japan:  {label:'Japan',  emoji:'🇯🇵'},
+  russia: {label:'Russia', emoji:'🇷🇺'},
+  cute:   {label:'Cute',   emoji:'🥰'}
 };
 
 (() => {
@@ -350,7 +363,7 @@ const CATS = {
 
   /* ---------- Favorites (max 50, saved in this browser) ---------- */
   const FAV_MAX = 50;
-  let favs = [], memFavs = null, prevFilter = 'random', clearT;
+  let favs = [], memFavs = null, prevFilter = START_CAT, clearT;
   try { const j = JSON.parse(localStorage.getItem('favs') || '[]'); if (Array.isArray(j)) favs = j.filter(f => f && typeof f.url === 'string').slice(0, FAV_MAX); } catch (e) {}
   const esc = t => String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const favLabel = f => { if (f.title) return f.title; try { const u = new URL(f.url); return (u.host + u.pathname).slice(0, 60); } catch (e) { return f.url.slice(0, 60); } };
@@ -408,7 +421,7 @@ const CATS = {
     showList(favs.map(f => ({url:f.url, title:f.title, cat:'fav'})));
     if (i > 0) feed.scrollTop = i * feed.clientHeight;
   }
-  $('favExit').onclick = () => { closeFav(); if (mode === 'secret') selectCat(CATS[prevFilter] ? prevFilter : 'random'); else showDefault(); };
+  $('favExit').onclick = () => { closeFav(); if (mode === 'secret') selectCat(prevFilter || START_CAT); else showDefault(); };
 
   /* ---------- Zoom 0.5x – 3x ---------- */
   function setZoom(z){
@@ -431,7 +444,7 @@ const CATS = {
   menu.onclick = e => { const li = e.target.closest('li'); if (!li) return; closeMenu(); selectCat(li.dataset.cat); };
 
   /* ---------- Backend ---------- */
-  let mode = 'default', token = null, filter = 'random', seen = new Set(), more = false, exhausted = false;
+  let mode = 'default', token = null, filter = START_CAT, seen = new Set(), more = false, exhausted = false;
   const shuffle = a => { for (let i = a.length - 1; i > 0; i--){ const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 
   async function api(path, body, auth){
@@ -454,7 +467,9 @@ const CATS = {
     bad_pin_format:'PIN must be 4 digits',
     unknown_user:'Account not found. Create a new PIN',
     rate_limited:'Too many tries. Wait 5 minutes',
-    bad_token:'Session expired. Enter the PIN again'
+    bad_token:'Session expired. Enter the PIN again',
+    bad_search:'Type a valid keyword (letters and numbers)',
+    search_limit:'Too many new searches. Try again later',
   };
   const fail = e => toast(ERR[e.code] || 'Something went wrong');
 
@@ -468,31 +483,46 @@ const CATS = {
   async function fetchBatch(key, n){
     const r = await api('/api/feed', {cat:key, n, exclude:[...seen].slice(-300)}, true);
     if (r.reset) seen = new Set();   // everything was shown once, server starts over
-    return r.items || [];
+    r.items = r.items || [];
+    return r;
   }
   async function loadMore(){
     if (mode !== 'secret' || more || exhausted) return;
     more = true; const t = token, f = filter;
     try {
-      const items = await fetchBatch(f, 10);
+      const items = (await fetchBatch(f, 10)).items;
       if (token !== t || filter !== f) return;
       if (!items.length) exhausted = true;
       items.forEach(x => { seen.add(x.id); STREAMS.push(x); makeReel(STREAMS.length - 1); });
     } catch (e) { if (e.code === 'bad_token') exitSecret(); }
     finally { more = false; }
   }
+  /* Search = menu button or typed keyword. If the bot has no links for it yet, it asks link_file.py
+     (search=<keyword>) and answers {searching:true}; we ask again every 4 s (max ~80 s). */
+  let searchGen = 0;
+  const label = k => (CATS[k] && CATS[k].label) || k;
   async function selectCat(key){
-    filter = key; exhausted = false;
+    filter = key; exhausted = false; const my = ++searchGen;
     [...menu.children].forEach(li => li.classList.toggle('on', li.dataset.cat === key));
     $('spinner').classList.add('on');
+    await tryCat(key, my, 0);
+  }
+  async function tryCat(key, my, tries){
     const t = token;
     try {
       seen = new Set();
-      const list = await fetchBatch(key, key === 'random' ? 12 : 20);
-      if (token !== t) return;
-      if (!list.length){ $('spinner').classList.remove('on'); toast('No videos in ' + CATS[key].label + ' yet'); return; }
-      showList(list);
+      const r = await fetchBatch(key, key === 'random' ? 12 : 20);
+      if (token !== t || my !== searchGen) return;
+      if (r.items.length){ showList(r.items); return; }
+      if (r.searching && tries < 20){
+        if (tries === 0) toast('Searching "' + label(key) + '"…');
+        setTimeout(() => { if (token === t && my === searchGen) tryCat(key, my, tries + 1); }, 4000);
+        return;
+      }
+      $('spinner').classList.remove('on');
+      toast('No videos found for "' + label(key) + '"');
     } catch (e) {
+      if (my !== searchGen) return;
       $('spinner').classList.remove('on');
       if (e.code === 'bad_token') exitSecret();
       fail(e);
@@ -506,26 +536,41 @@ const CATS = {
     let list = [], err = null;
     try {
       const r = await api('/api/defaults', {});          // set by the admin in the bot > Web Start
-      list = (r.items || []).map(x => ({url:x.url, title:x.title || '', cat:'default'}));
+      list = shuffle((r.items || []).map(x => ({url:x.url, title:x.title || '', cat:'default'})));   // random order
     } catch (e) { err = e; }
     if (mode !== 'default' || filter !== 'default') return;   // user already went elsewhere
     if (!list.length){
       $('spinner').classList.remove('on'); showList([]);
-      if (err) fail(err); else toast('No start videos yet. Admin: bot > Web Start');
+      if (err) fail(err); else toast('No start videos');
       return;
     }
     showList(list);
   }
   function enterSecret(){
     mode = 'secret';
-    $('menuWrap').hidden = false; $('keyBtn').classList.add('on'); $('keyBtn').setAttribute('aria-label', 'Back to default');
-    selectCat('random');
+    $('menuWrap').hidden = false; $('searchBtn').hidden = false; $('keyBtn').classList.add('on'); $('keyBtn').setAttribute('aria-label', 'Back to default');
+    selectCat(START_CAT);
   }
   function exitSecret(){
     mode = 'default'; token = null;
-    closeMenu(); $('menuWrap').hidden = true; $('keyBtn').classList.remove('on'); $('keyBtn').setAttribute('aria-label', 'Enter PIN');
+    closeMenu(); closeSearch(); searchGen++; $('menuWrap').hidden = true; $('searchBtn').hidden = true; $('keyBtn').classList.remove('on'); $('keyBtn').setAttribute('aria-label', 'Enter PIN');
     showDefault();
   }
+
+  /* ---------- Search box ---------- */
+  const searchSheet = $('searchSheet'), searchIn = $('searchInput');
+  function openSearch(){ closeMenu(); searchSheet.classList.add('on'); searchIn.value = ''; setTimeout(() => searchIn.focus(), 200); }
+  function closeSearch(){ searchSheet.classList.remove('on'); searchIn.blur(); }
+  function doSearch(){
+    const kw = searchIn.value.trim().replace(/\s+/g, ' ').toLowerCase().slice(0, 40);
+    if (!kw){ toast('Type a keyword'); return; }
+    closeSearch(); selectCat(kw);
+  }
+  $('searchBtn').onclick = openSearch;
+  $('searchGo').onclick = doSearch;
+  $('searchCancel').onclick = closeSearch;
+  searchIn.addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); doSearch(); } });
+  searchSheet.addEventListener('click', e => { if (e.target === searchSheet) closeSearch(); });
 
   /* ---------- PIN: every user creates their own, the account id stays in their browser ---------- */
   let memUid = null;

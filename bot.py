@@ -3,8 +3,9 @@
 Telegram admin bot + website + backend  (ONE process, Telegram POLLING)
 
 Needs an always-on host (Render, Railway, VPS ...). Vercel cannot run polling.
+NO Firebase: everything is stored in one local SQLite file (data.db).
 
-Install:  pip install -U python-telegram-bot firebase-admin aiohttp
+Install:  pip install -U python-telegram-bot aiohttp
 Run:      python bot.py
 
 Environment variables (or paste the values in CONFIG below):
@@ -12,14 +13,22 @@ Environment variables (or paste the values in CONFIG below):
   ADMIN_ID      your numeric Telegram user id (ask @userinfobot)
   KEY_64        64-char random secret: python -c "import secrets;print(secrets.token_hex(32))"
                 (signs web sessions + salts PINs. Do NOT change it later, PINs would stop working)
-  FIREBASE_B64  base64 of the Firebase *service account* JSON  (base64 -w0 serviceAccount.json)
   WEB_URL       (optional) public https URL of the website -> "Watch" button for users.
                 On Render it is picked up from RENDER_EXTERNAL_URL automatically.
+  DB_PATH       (optional) where data.db lives, default: next to bot.py
   PORT          set automatically by Render/Railway, default 8080
 
+How links work
+  Website start     -> built-in DEFAULT_VIDEOS (below) + Web Start list, in RANDOM order
+  After PIN         -> "india" videos (random) + search box + menu (India/Japan/Russia/Cute/Random)
+  Search            -> bot reads links straight from SQLite table `links`.
+                       If the keyword has no links yet, bot calls link_file.on_search(keyword)
+                       (request = "search=<keyword>"). Your code in link_file.py fetches links
+                       and saves them in the DB. Format + DB details are written in link_file.py.
+
 Admin panel (Telegram, every step has Back)
-  Link Add / Link Remove (last 1 | last 50 | all | by link/number, 2x confirm)
-  Web Start   - videos that play when the website opens (add / remove / remove all)
+  Link Remove - by keyword (last 1 | last 50 | all | by link/number, 2x confirm)
+  Web Start   - extra videos that play when the website opens (add / remove / remove all)
   Start Msg   - welcome text + banner photo for normal users
   Broadcast   - send any message (text / photo / video ...) to all bot users
   Force Join  - users must join your channels before using the bot
@@ -32,21 +41,16 @@ Users (Telegram)
 Web API
   POST /api/register {pin}        -> user creates own PIN, gets uid + token
   POST /api/auth     {uid, pin}   -> login with own PIN, gets token
-  POST /api/feed     {cat,n,exclude} -> random links (from RAM cache)
-  POST /api/defaults              -> videos shown when the website starts (set in bot > Web Start)
+  POST /api/feed     {cat,n,exclude} -> random links for keyword `cat` ("random" = mix of all)
+                                        {items, reset, searching}
+  POST /api/defaults              -> start videos (built-in + Web Start), shuffled
 
-Firestore layout
-  India_video / Japan_video / Russia_video / Cute_video / Random_video
-      doc 000001, 000002 ...  fields: n, url, cat, title, added
-  meta/<collection>   { count }
-  domains/<id>        { host, added }
-  requests/<id>       { host, status: pending|approved|rejected, last, count }
-  users/<uid>         { salt, hash, created }      (web PIN, only a salted PBKDF2 hash)
-  tg_users/<tg_id>    { name, username, points, refs, ref_by, credited, blocked, joined }
-  settings/start      { text, photo }              (welcome message + banner file_id)
-  settings/web        { items: [{url,title}] }     (website start videos)
-  settings/force      { on, channels: [{chat,title,link}] }
-  settings/refer      { points }
+SQLite tables (data.db)
+  links(id, search, title, url, added)   UNIQUE(search, url)
+  kv(key, value)                         start / web / force / refer settings (JSON)
+  tg_users(id, data)                     bot users (JSON)
+  web_users(uid, salt, hash, created)    web PIN (only a salted PBKDF2 hash)
+  domains(host) / requests(hid, host, status, last, count)
 """
 import asyncio
 import base64
@@ -58,14 +62,12 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
-import firebase_admin
 from aiohttp import web
-from firebase_admin import credentials, firestore
-from google.cloud.firestore_v1.base_query import FieldFilter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
@@ -81,20 +83,54 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
 KEY_64 = os.getenv("KEY_64", "PASTE_KEY_64_HERE")
-FIREBASE_B64 = os.getenv("FIREBASE_B64", "PASTE_BASE64_OF_SERVICE_ACCOUNT_JSON_HERE")
 PORT = int(os.getenv("PORT", "8080"))
 WEB_URL = (os.getenv("WEB_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+DB_PATH = os.getenv("DB_PATH") or str(Path(__file__).resolve().parent / "data.db")
 
-# key = Firestore collection name. Order = order of the buttons in the bot.
-CATEGORIES = {
-    "Random_video": ("🎲", "Random"),
-    "India_video": ("🇮🇳", "India"),
-    "Japan_video": ("🇯🇵", "Japan"),
-    "Russia_video": ("🇷🇺", "Russia"),
-    "Cute_video": ("🥰", "Cute"),
+# Menu buttons on the website. key = the search keyword ("random" = mix of every keyword).
+PRESETS = {
+    "random": ("🎲", "Random"),
+    "india": ("🇮🇳", "India"),
+    "japan": ("🇯🇵", "Japan"),
+    "russia": ("🇷🇺", "Russia"),
+    "cute": ("🥰", "Cute"),
 }
-ONLY_M3U8 = False  # True = accept only links that contain ".m3u8"
-CHUNK = 400  # links written per transaction (Firestore limit is 500)
+START_SEARCH = "india"  # what plays right after the PIN
+ONLY_M3U8 = False  # True = accept only links that contain ".m3u8" (Web Start list)
+LINK_TIMEOUT = 120  # seconds link_file.on_search may run
+ASK_COOLDOWN = 120  # seconds before the same empty keyword is requested again
+MAX_SEARCHING = 5  # keywords link_file may work on at the same time
+MAX_NEW_SEARCH = 10  # new keywords one web user may request per hour
+
+# Videos that play when the website opens (always shuffled). Web Start (admin) adds more.
+DEFAULT_VIDEOS = [
+    ("Big Buck Bunny", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"),
+    ("Mux Test 001", "https://test-streams.mux.dev/test_001/stream.m3u8"),
+    ("Mux PTS Shift", "https://test-streams.mux.dev/pts_shift/master.m3u8"),
+    ("Mux Tears of Steel", "https://test-streams.mux.dev/tos_ismc/main.m3u8"),
+    ("Apple BipBop Advanced fMP4", "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"),
+    ("Apple BipBop Advanced TS", "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8"),
+    ("Apple BipBop 4x3", "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8"),
+    ("Apple BipBop 16x9", "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_16x9/bipbop_16x9_variant.m3u8"),
+    ("Apple Dolby Atmos", "https://devstreaming-cdn.apple.com/videos/streaming/examples/adv_dv_atmos/main.m3u8"),
+    ("Sintel", "https://bitdash-a.akamaihd.net/content/sintel/hls/playlist.m3u8"),
+    ("Tears of Steel", "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8"),
+    ("Bitmovin Art of Motion", "https://cdn.bitmovin.com/content/assets/art-of-motion-dash-hls-progressive/m3u8s/f08e80da-bf1d-4e3d-8899-f0f6155f6efa.m3u8"),
+    ("Bitmovin MI201109210084", "https://bitmovin-a.akamaihd.net/content/MI201109210084_1/m3u8s/f08e80da-bf1d-4e3d-8899-f0f6155f6efa.m3u8"),
+    ("Oceans AES", "https://playertest.longtailvideo.com/adaptive/oceans_aes/oceans_aes.m3u8"),
+    ("Wowza ID3", "https://playertest.longtailvideo.com/adaptive/wowzaid3/playlist.m3u8"),
+    ("Big Buck Bunny Full", "https://playertest.longtailvideo.com/adaptive/bbbfull/bbbfull.m3u8"),
+    ("Elephants Dream", "https://playertest.longtailvideo.com/adaptive/elephants_dream_v4/index.m3u8"),
+    ("Elephants Dream Wowza", "https://wowzaec2demo.streamlock.net/vod-multitrack/_definst_/smil:ElephantsDream/elephantsdream2.smil/playlist.m3u8"),
+    ("Big Buck Bunny CloudFront", "https://d2zihajmogu5jn.cloudfront.net/big-buck-bunny/master.m3u8"),
+    ("BipBop CloudFront", "https://d2zihajmogu5jn.cloudfront.net/bipbop-advanced/bipbop_16x9_variant.m3u8"),
+    ("Shaka Angel One", "https://storage.googleapis.com/shaka-demo-assets/angel-one-hls/hls.m3u8"),
+    ("Skate 4K", "https://sample.vodobox.net/skate_phantom_flex_4k/skate_phantom_flex_4k.m3u8"),
+    ("Akamai Live Test", "https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/master.m3u8"),
+    ("Akamai Live Eight", "https://moctobpltc-i.akamaihd.net/hls/live/571329/eight/playlist.m3u8"),
+    ("Big Buck Bunny Akamai", "https://multiplatform-f.akamaihd.net/i/multi/will/bunny/big_buck_bunny_,640x360_400,640x360_700,640x360_1000,950x540_1500,.f4v.csmil/master.m3u8"),
+]
+
 TOKEN_TTL = 12 * 3600  # web login lasts 12 h
 PAGE = 10  # requests per page in the bot
 WEB_PAGE = 8  # web-start videos per page in the bot
@@ -107,16 +143,19 @@ BC_DELAY = 0.05  # pause between broadcast messages (~20 msg/s, Telegram allows 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
+try:
+    import link_file  # your fetch code, see link_file.py
+except Exception:  # a missing / broken link_file.py must not stop the bot
+    log.exception("link_file.py could not be imported (searches will only use links already in the DB)")
+    link_file = None
+
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 LEGACY_TITLE_RE = re.compile(r"^(Random|India|Japan|Russia|Cute) #\d+$")
 
-db = None
-ADD_LOCK: asyncio.Lock | None = None
-
-# ---- RAM cache: the web never reads Firestore, it reads these ----
-CACHE = {k: [] for k in CATEGORIES}  # list of {id,url,title,cat,doc}
-CACHE_URLS = {k: set() for k in CATEGORIES}
-CACHE_MAXN = {k: 0 for k in CATEGORIES}
+# ---- RAM state. Links are NOT cached: the web reads them straight from SQLite ----
+SEARCHING: dict[str, float] = {}  # keyword -> start time, while link_file works on it
+LAST_ASK: dict[str, float] = {}  # keyword -> when link_file last finished
+ASKS: dict[str, list[float]] = {}  # web uid -> times of new keyword requests
 DOMAINS: set[str] = set()  # approved hosts
 USERS: dict[str, dict] = {}  # web uid -> {"salt","hash"}   (loaded on demand)
 
@@ -151,7 +190,13 @@ def clean_title(t) -> str:
 
 
 def num_of(item) -> int:
-    return int(item["id"].split(":")[1])
+    return int(item["id"])
+
+
+def norm_kw(s) -> str:
+    """'  Goa  Trip ' -> 'goa trip'. Empty string if it is not a usable keyword."""
+    s = re.sub(r"\s+", " ", str(s or "").strip().lower())[:40].strip()
+    return s if re.fullmatch(r"\w[\w \-]*", s) else ""
 
 
 def short(x: str, n: int = 40) -> str:
@@ -191,51 +236,88 @@ def parse_entries(text: str) -> list[tuple[str, str]]:
     return out
 
 
-# ------------------------------------------------------------------ Firestore (blocking; call with to_thread)
+# ------------------------------------------------------------------ SQLite (blocking; call with to_thread)
+def sql(query: str, args=(), fetch: str | None = None):
+    """One short connection per call (safe with threads and with link_file.py writing at the same time)."""
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        c.row_factory = sqlite3.Row
+        cur = c.execute(query, args)
+        if fetch == "all":
+            out = [dict(r) for r in cur.fetchall()]
+        elif fetch == "one":
+            r = cur.fetchone()
+            out = dict(r) if r else None
+        else:
+            out = cur.rowcount
+        c.commit()
+        return out
+    finally:
+        c.close()
+
+
+def init_db():
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS links(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search TEXT NOT NULL, title TEXT DEFAULT '', url TEXT NOT NULL, added REAL,
+                UNIQUE(search, url));
+            CREATE INDEX IF NOT EXISTS links_search ON links(search);
+            CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS tg_users(id INTEGER PRIMARY KEY, data TEXT);
+            CREATE TABLE IF NOT EXISTS web_users(uid TEXT PRIMARY KEY, salt TEXT, hash TEXT, created REAL);
+            CREATE TABLE IF NOT EXISTS domains(host TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS requests(
+                hid TEXT PRIMARY KEY, host TEXT, status TEXT, last REAL, count INTEGER DEFAULT 1);
+            """
+        )
+        c.commit()
+    finally:
+        c.close()
+
+
+def kv_get(name: str) -> dict:
+    r = sql("SELECT value FROM kv WHERE key=?", (name,), "one")
+    try:
+        return json.loads(r["value"]) if r else {}
+    except ValueError:
+        return {}
+
+
+def kv_set(name: str, obj: dict):
+    sql(
+        "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (name, json.dumps(obj)),
+    )
+
+
 def load_all():
-    for cat in CATEGORIES:
-        items, urls, maxn = [], set(), 0
-        for d in db.collection(cat).stream():
-            x = d.to_dict() or {}
-            url, n = x.get("url"), int(x.get("n", 0))
-            if not url:
-                continue
-            items.append({"id": f"{cat}:{n}", "url": url, "title": clean_title(x.get("title")), "cat": cat, "doc": d.id})
-            urls.add(url)
-            maxn = max(maxn, n)
-        items.sort(key=num_of)
-        CACHE[cat], CACHE_URLS[cat], CACHE_MAXN[cat] = items, urls, maxn
-        log.info("cache %s: %d links", cat, len(items))
+    init_db()
     DOMAINS.clear()
-    for d in db.collection("domains").stream():
-        h = (d.to_dict() or {}).get("host")
-        if h:
-            DOMAINS.add(h)
+    DOMAINS.update(r["host"] for r in sql("SELECT host FROM domains", (), "all"))
     log.info("approved domains: %d", len(DOMAINS))
-
-    def setting(name):
-        snap = db.collection("settings").document(name).get()
-        return (snap.to_dict() or {}) if snap.exists else {}
-
-    st = setting("start")
+    st = kv_get("start")
     START["text"], START["photo"] = st.get("text", "") or "", st.get("photo", "") or ""
     WEB_VIDS[:] = [
         {"url": x["url"], "title": clean_title(x.get("title"))}
-        for x in setting("web").get("items", [])
+        for x in kv_get("web").get("items", [])
         if isinstance(x, dict) and x.get("url")
     ]
-    fj = setting("force")
+    fj = kv_get("force")
     FORCE["on"] = bool(fj.get("on"))
     FORCE["channels"] = [c for c in fj.get("channels", []) if isinstance(c, dict) and c.get("chat")]
-    REF["points"] = int(setting("refer").get("points", DEFAULT_REF_POINTS))
+    REF["points"] = int(kv_get("refer").get("points", DEFAULT_REF_POINTS))
     TGU.clear()
-    for d in db.collection("tg_users").stream():
-        x = d.to_dict() or {}
+    for r in sql("SELECT id, data FROM tg_users", (), "all"):
         try:
-            uid = int(d.id)
+            x = json.loads(r["data"] or "{}")
         except ValueError:
             continue
-        TGU[uid] = {
+        TGU[int(r["id"])] = {
             "name": x.get("name", ""),
             "username": x.get("username", ""),
             "points": int(x.get("points", 0)),
@@ -244,132 +326,193 @@ def load_all():
             "credited": bool(x.get("credited")),
             "blocked": bool(x.get("blocked")),
         }
-    log.info("bot users: %d | web-start videos: %d | force channels: %d", len(TGU), len(WEB_VIDS), len(FORCE["channels"]))
+    log.info(
+        "links: %d | bot users: %d | web-start videos: %d | force channels: %d",
+        db_total_links(), len(TGU), len(WEB_VIDS), len(FORCE["channels"]),
+    )
 
 
-@firestore.transactional
-def _write_chunk(tx, cat, meta_ref, base, chunk):
-    snap = meta_ref.get(transaction=tx)
-    count = (snap.to_dict() or {}).get("count", 0) if snap.exists else 0
-    start = max(count, base)  # never reuse a number
-    col = db.collection(cat)
-    label = CATEGORIES[cat][1]
-    for k, (url, title) in enumerate(chunk, 1):
-        n = start + k
-        tx.set(
-            col.document(f"{n:06d}"),
-            {"n": n, "url": url, "cat": cat, "title": title, "label": label, "added": firestore.SERVER_TIMESTAMP},
-        )
-    tx.set(meta_ref, {"count": start + len(chunk)}, merge=True)
-    return start + 1, start + len(chunk)
+# ---- links (written by link_file.py, read by the web + admin) ----
+def db_total_links() -> int:
+    return sql("SELECT COUNT(*) AS n FROM links", (), "one")["n"]
 
 
-def store_links(cat: str, entries: list[tuple[str, str]]) -> dict:
-    known = CACHE_URLS[cat]  # duplicate check uses the cache, no Firestore reads
-    new = [(u, t) for u, t in entries if u not in known]
-    base = CACHE_MAXN[cat]
-    meta_ref = db.collection("meta").document(cat)
-    added, first, last = [], None, None
-    for i in range(0, len(new), CHUNK):
-        chunk = new[i : i + CHUNK]
-        a, b = _write_chunk(db.transaction(), cat, meta_ref, base, chunk)
-        for k, (u, t) in enumerate(chunk):
-            added.append({"id": f"{cat}:{a + k}", "url": u, "title": t, "cat": cat, "doc": f"{a + k:06d}"})
-        base, first, last = b, first or a, b
-    return {"items": added, "dup": len(entries) - len(new), "first": first, "last": last}
+def db_keywords() -> list[dict]:
+    """[{search, n}, ...] biggest first."""
+    return sql("SELECT search, COUNT(*) AS n FROM links GROUP BY search ORDER BY n DESC, search", (), "all")
 
 
-def fs_delete_docs(cat: str, docs: list[str]):
-    """Deletes documents of one collection in batches (Firestore limit 500 per batch)."""
-    col = db.collection(cat)
-    for i in range(0, len(docs), 400):
-        batch = db.batch()
-        for d in docs[i : i + 400]:
-            batch.delete(col.document(d))
-        batch.commit()
+def db_count(kw: str) -> int:
+    return sql("SELECT COUNT(*) AS n FROM links WHERE search=?", (kw,), "one")["n"]
 
 
-def fs_add_domain(host):
+def db_pick(kw: str, n: int, exclude: list[int]):
+    """n random links for `kw` ("random" = every keyword), never the ids in `exclude`.
+    When everything was already seen, starts over (reset=True)."""
+    def q(ex):
+        cond, args = [], []
+        if kw != "random":
+            cond.append("search=?")
+            args.append(kw)
+        if ex:
+            cond.append("id NOT IN (" + ",".join(str(i) for i in ex) + ")")
+        where = ("WHERE " + " AND ".join(cond)) if cond else ""
+        return sql(f"SELECT id, search, title, url FROM links {where} ORDER BY RANDOM() LIMIT ?", (*args, n), "all")
+
+    rows = q(exclude)
+    if rows or not exclude:
+        return rows, False
+    return q([]), True
+
+
+def db_newest(kw: str, n: int | None) -> list[dict]:
+    lim = " LIMIT %d" % n if n else ""
+    return sql(f"SELECT id, search, title, url FROM links WHERE search=? ORDER BY id DESC{lim}", (kw,), "all")
+
+
+def db_match(kw: str, nums: set[int], urls: set[str]) -> list[dict]:
+    return [x for x in db_newest(kw, None) if x["id"] in nums or x["url"] in urls]
+
+
+def db_delete_links(ids: list[int]):
+    for i in range(0, len(ids), 400):
+        part = ids[i : i + 400]
+        sql("DELETE FROM links WHERE id IN (%s)" % ",".join("?" * len(part)), part)
+
+
+# ---- domains / requests ----
+def db_add_domain(host):
     h = hid_of(host)
-    db.collection("domains").document(h).set({"host": host, "added": firestore.SERVER_TIMESTAMP})
-    db.collection("requests").document(h).set(
-        {"host": host, "status": "approved", "last": firestore.SERVER_TIMESTAMP}, merge=True
+    sql("INSERT OR IGNORE INTO domains(host) VALUES(?)", (host,))
+    sql(
+        "INSERT INTO requests(hid,host,status,last,count) VALUES(?,?,'approved',?,0) "
+        "ON CONFLICT(hid) DO UPDATE SET status='approved', last=excluded.last",
+        (h, host, time.time()),
     )
 
 
-def fs_remove_domain(host, status="rejected"):
+def db_remove_domain(host, status="rejected"):
     h = hid_of(host)
-    db.collection("domains").document(h).delete()
-    db.collection("requests").document(h).set(
-        {"host": host, "status": status, "last": firestore.SERVER_TIMESTAMP}, merge=True
+    sql("DELETE FROM domains WHERE host=?", (host,))
+    sql(
+        "INSERT INTO requests(hid,host,status,last,count) VALUES(?,?,?,?,0) "
+        "ON CONFLICT(hid) DO UPDATE SET status=excluded.status, last=excluded.last",
+        (h, host, status, time.time()),
     )
 
 
-def fs_get_host(hid):
-    snap = db.collection("requests").document(hid).get()
-    return (snap.to_dict() or {}).get("host") if snap.exists else None
+def db_get_host(hid):
+    r = sql("SELECT host FROM requests WHERE hid=?", (hid,), "one")
+    return r["host"] if r else None
 
 
-def fs_list_requests(page):
-    q = (
-        db.collection("requests")
-        .order_by("last", direction=firestore.Query.DESCENDING)
-        .offset(page * PAGE)
-        .limit(PAGE + 1)
+def db_list_requests(page):
+    rows = sql(
+        "SELECT hid, host, status, last, count FROM requests ORDER BY last DESC LIMIT ? OFFSET ?",
+        (PAGE + 1, page * PAGE),
+        "all",
     )
-    rows = [{"hid": d.id, **(d.to_dict() or {})} for d in q.stream()]
     return rows[:PAGE], len(rows) > PAGE
 
 
-def fs_pending_count():
-    q = db.collection("requests").where(filter=FieldFilter("status", "==", "pending"))
-    return sum(1 for _ in q.stream())
+def db_pending_count():
+    return sql("SELECT COUNT(*) AS n FROM requests WHERE status='pending'", (), "one")["n"]
 
 
-def fs_save_start():
-    db.collection("settings").document("start").set({"text": START["text"], "photo": START["photo"]})
-
-
-def fs_save_web():
-    db.collection("settings").document("web").set({"items": WEB_VIDS})
-
-
-def fs_save_force():
-    db.collection("settings").document("force").set({"on": FORCE["on"], "channels": FORCE["channels"]})
-
-
-def fs_save_refer():
-    db.collection("settings").document("refer").set({"points": REF["points"]})
-
-
-def fs_save_user(uid: int, data: dict):
-    db.collection("tg_users").document(str(uid)).set(data, merge=True)
-
-
-def fs_get_user(uid):
-    snap = db.collection("users").document(uid).get()
-    return snap.to_dict() if snap.exists else None
-
-
-def fs_create_user(uid, salt, h):
-    db.collection("users").document(uid).set({"salt": salt, "hash": h, "created": firestore.SERVER_TIMESTAMP})
-
-
-def fs_count_users():
-    try:
-        return db.collection("users").count().get()[0][0].value
-    except Exception:
-        return sum(1 for _ in db.collection("users").select([]).stream())
-
-
-def fs_note_request(host):
+def db_note_request(host):
     """Called when an unapproved domain hits the API. Returns True if it is a brand-new request."""
-    ref = db.collection("requests").document(hid_of(host))
-    if ref.get().exists:
-        ref.update({"last": firestore.SERVER_TIMESTAMP, "count": firestore.Increment(1)})
+    h = hid_of(host)
+    if sql("SELECT 1 AS x FROM requests WHERE hid=?", (h,), "one"):
+        sql("UPDATE requests SET last=?, count=count+1 WHERE hid=?", (time.time(), h))
         return False
-    ref.set({"host": host, "status": "pending", "last": firestore.SERVER_TIMESTAMP, "count": 1})
+    sql("INSERT INTO requests(hid,host,status,last,count) VALUES(?,?,'pending',?,1)", (h, host, time.time()))
     return True
+
+
+# ---- settings / users ----
+def db_save_start():
+    kv_set("start", {"text": START["text"], "photo": START["photo"]})
+
+
+def db_save_web():
+    kv_set("web", {"items": WEB_VIDS})
+
+
+def db_save_force():
+    kv_set("force", {"on": FORCE["on"], "channels": FORCE["channels"]})
+
+
+def db_save_refer():
+    kv_set("refer", {"points": REF["points"]})
+
+
+def db_save_user(uid: int, data: dict):
+    r = sql("SELECT data FROM tg_users WHERE id=?", (uid,), "one")
+    cur = json.loads(r["data"]) if r else {}
+    cur.update(data)
+    sql(
+        "INSERT INTO tg_users(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+        (uid, json.dumps(cur)),
+    )
+
+
+def db_get_user(uid):
+    return sql("SELECT salt, hash FROM web_users WHERE uid=?", (uid,), "one")
+
+
+def db_create_user(uid, salt, h):
+    sql("INSERT INTO web_users(uid,salt,hash,created) VALUES(?,?,?,?)", (uid, salt, h, time.time()))
+
+
+def db_count_users():
+    return sql("SELECT COUNT(*) AS n FROM web_users", (), "one")["n"]
+
+
+def default_items() -> list[dict]:
+    """Built-in DEFAULT_VIDEOS + admin Web Start videos, no duplicates, random order."""
+    out, seen = [], set()
+    for title, url in DEFAULT_VIDEOS + [(x.get("title", ""), x["url"]) for x in WEB_VIDS]:
+        if url not in seen:
+            seen.add(url)
+            out.append({"url": url, "title": title})
+    random.shuffle(out)
+    return out
+
+
+async def run_link_file(kw: str):
+    """Calls link_file.on_search(kw) in a thread. The links it saves into the DB are picked up by the next /api/feed."""
+    SEARCHING[kw] = time.time()
+    try:
+        fn = getattr(link_file, "on_search", None)
+        if not fn:
+            log.warning("link_file.on_search not found, nothing fetched for search=%s", kw)
+        else:
+            log.info("request: search=%s", kw)
+            await asyncio.wait_for(asyncio.to_thread(fn, kw), LINK_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("link_file.on_search(%s) took more than %ds", kw, LINK_TIMEOUT)
+    except Exception:
+        log.exception("link_file.on_search(%s) failed", kw)
+    finally:
+        SEARCHING.pop(kw, None)
+        LAST_ASK[kw] = time.time()
+
+
+def ask_link_file(request, uid: str, kw: str) -> str:
+    """'busy' (link_file is working on kw) | 'started' | 'later' (asked a moment ago, nothing came) | 'limit'."""
+    now = time.time()
+    if kw in SEARCHING:
+        return "busy"
+    if now - LAST_ASK.get(kw, 0) < ASK_COOLDOWN:
+        return "later"
+    ASKS[uid] = [t for t in ASKS.get(uid, []) if now - t < 3600]
+    if len(ASKS[uid]) >= MAX_NEW_SEARCH or len(SEARCHING) >= MAX_SEARCHING:
+        return "limit"
+    ASKS[uid].append(now)
+    task = asyncio.create_task(run_link_file(kw))
+    request.app["tasks"].add(task)
+    task.add_done_callback(request.app["tasks"].discard)
+    return "started"
 
 
 # ------------------------------------------------------------------ web API
@@ -458,7 +601,7 @@ def own_host(request):
 
 async def register_request(tg, host):
     try:
-        is_new = await asyncio.to_thread(fs_note_request, host)
+        is_new = await asyncio.to_thread(db_note_request, host)
     except Exception:
         log.exception("could not log request")
         return
@@ -510,7 +653,7 @@ async def api_register(request):
     REG[ip].append(now)
     uid, salt = secrets.token_hex(16), secrets.token_hex(16)
     h = await asyncio.to_thread(hash_pin, pin, salt)
-    await asyncio.to_thread(fs_create_user, uid, salt, h)
+    await asyncio.to_thread(db_create_user, uid, salt, h)
     USERS[uid] = {"salt": salt, "hash": h}
     return web.json_response({"ok": True, "uid": uid, "token": make_token(host, uid)})
 
@@ -527,7 +670,7 @@ async def api_auth(request):
         return jerr(429, "rate_limited")
     user = USERS.get(uid) if re.fullmatch(r"[0-9a-f]{32}", uid) else None
     if not user and re.fullmatch(r"[0-9a-f]{32}", uid):
-        user = await asyncio.to_thread(fs_get_user, uid)
+        user = await asyncio.to_thread(db_get_user, uid)
         if user:
             USERS[uid] = user
     if not user:
@@ -541,76 +684,47 @@ async def api_auth(request):
     return web.json_response({"ok": True, "token": make_token(host, uid)})
 
 
-def pick(pools, n, exclude):
-    """n random items, never the ones in `exclude`. When everything was seen, start over."""
-    total = sum(len(p) for p in pools)
-    if not total:
-        return [], False
-
-    def at(i):
-        for p in pools:
-            if i < len(p):
-                return p[i]
-            i -= len(p)
-
-    out, ids, tries = [], set(), 0
-    while len(out) < n and tries < n * 30:
-        tries += 1
-        x = at(random.randrange(total))
-        if x["id"] in exclude or x["id"] in ids:
-            continue
-        ids.add(x["id"])
-        out.append(x)
-    if len(out) < n:  # most links already seen -> exact pass
-        rest = [x for p in pools for x in p if x["id"] not in exclude and x["id"] not in ids]
-        random.shuffle(rest)
-        out += rest[: n - len(out)]
-    if out:
-        return out, False
-    every = [x for p in pools for x in p]
-    random.shuffle(every)
-    return every[:n], True
-
-
 async def api_feed(request):
     host, err = await gate(request)
     if err:
         return err
     auth = request.headers.get("Authorization", "")
-    if not (auth.startswith("Bearer ") and check_token(auth[7:], host)):
+    uid = check_token(auth[7:], host) if auth.startswith("Bearer ") else None
+    if not uid:
         return jerr(401, "bad_token")
     data = await read_json(request)
-    key = str(data.get("cat", "random"))
+    kw = norm_kw(data.get("cat") or START_SEARCH)  # "random" or a search keyword
+    if not kw:
+        return jerr(400, "bad_search")
     try:
         n = max(1, min(30, int(data.get("n", 10))))
     except (TypeError, ValueError):
         n = 10
     ex = data.get("exclude")
-    exclude = {str(x) for x in ex[:500]} if isinstance(ex, list) else set()
-    if key == "random":
-        pools = [CACHE[c] for c in CATEGORIES]
-    elif key in CACHE:
-        pools = [CACHE[key]]
-    else:
-        return jerr(400, "bad_cat")
-    items, reset = pick(pools, n, exclude)
+    exclude = [int(x) for x in ex[:500] if str(x).isdigit()] if isinstance(ex, list) else []
+    items, reset = await asyncio.to_thread(db_pick, kw, n, exclude)
+    searching = False
+    if not items and kw != "random":  # nothing for this keyword yet -> request = "search=<kw>"
+        state = ask_link_file(request, uid, kw)
+        if state == "limit":
+            return jerr(429, "search_limit")
+        searching = state in ("started", "busy")
     return web.json_response(
         {
             "ok": True,
             "reset": reset,
-            "items": [{"id": x["id"], "url": x["url"], "title": x["title"], "cat": x["cat"]} for x in items],
+            "searching": searching,
+            "items": [{"id": x["id"], "url": x["url"], "title": clean_title(x["title"]), "cat": x["search"]} for x in items],
         }
     )
 
 
 async def api_defaults(request):
-    """Videos shown when the website starts (set by the admin in the bot > Web Start)."""
+    """Videos shown when the website starts: built-in DEFAULT_VIDEOS + Web Start, shuffled."""
     host, err = await gate(request)
     if err:
         return err
-    return web.json_response(
-        {"ok": True, "items": [{"url": x["url"], "title": x.get("title", "")} for x in WEB_VIDS]}
-    )
+    return web.json_response({"ok": True, "items": default_items()})
 
 
 async def index(request):
@@ -643,12 +757,12 @@ def is_admin(update: Update) -> bool:
 
 def home_text():
     blocked = sum(1 for x in TGU.values() if x.get("blocked"))
-    links = sum(len(v) for v in CACHE.values())
+    links = db_total_links()
     fj = "🟢 ON" if FORCE["on"] and FORCE["channels"] else "🔴 OFF"
     return (
         f"🛠 ADMIN PANEL\n{LINE}\n"
         f"👥 Users: {len(TGU)}  (🚫 {blocked})\n"
-        f"🔗 Links: {links}   🎬 Web start: {len(WEB_VIDS)}\n"
+        f"🔗 Links: {links}   🎬 Web start: {len(DEFAULT_VIDEOS) + len(WEB_VIDS)}\n"
         f"🌐 Domains: {len(DOMAINS)}\n"
         f"🔒 Force join: {fj}   🎁 Refer: +{REF['points']} pts\n"
         f"{LINE}\nKya karna hai? 👇"
@@ -658,12 +772,11 @@ def home_text():
 def main_kb():
     return kb(
         [
-            [B("➕ Link Add", "la"), B("🗑 Link Remove", "lr")],
-            [B("🎬 Web Start", "ws:0"), B("💬 Start Msg", "sm")],
-            [B("📣 Broadcast", "bc"), B("🔒 Force Join", "fj")],
-            [B("🎁 Refer System", "rf"), B("🌐 Domain", "dm")],
-            [B("📨 Request", "rq:0"), B("📊 Status", "st")],
-            [B("👁 User View", "uv")],
+            [B("🗑 Link Remove", "lr"), B("🎬 Web Start", "ws:0")],
+            [B("💬 Start Msg", "sm"), B("📣 Broadcast", "bc")],
+            [B("🔒 Force Join", "fj"), B("🎁 Refer System", "rf")],
+            [B("🌐 Domain", "dm"), B("📨 Request", "rq:0")],
+            [B("📊 Status", "st"), B("👁 User View", "uv")],
         ]
     )
 
@@ -684,18 +797,20 @@ async def show(update: Update, text: str, markup=None):
         await update.effective_message.reply_text(text, reply_markup=markup)
 
 
-def cat_kb(prefix, counts=False):
-    btn = []
-    for k, (e, n) in CATEGORIES.items():
-        btn.append(B(f"{e} {n}" + (f" ({len(CACHE[k])})" if counts else ""), f"{prefix}:{k}"))
+def kw_kb(prefix):
+    """One button per keyword that has links in the DB (callback carries a hash of the keyword)."""
+    btn = [B(f"🔎 {short(k['search'], 18)} ({k['n']})", f"{prefix}:{hid_of(k['search'])}") for k in db_keywords()[:40]]
     rows = [btn[i : i + 2] for i in range(0, len(btn), 2)]
     rows.append(BACK)
     return kb(rows)
 
 
-def tag(cat):
-    e, n = CATEGORIES[cat]
-    return f"{e} {n}"
+def kw_by_hid(h: str) -> str | None:
+    return next((k["search"] for k in db_keywords() if hid_of(k["search"]) == h), None)
+
+
+def tag(kw):
+    return f"🔎 {kw}"
 
 
 # ------------------------------------------------------------------ telegram users, referral, force join
@@ -713,7 +828,7 @@ async def register_user(user, ref: int | None = None):
             "blocked": False,
         }
         TGU[user.id] = u
-        await asyncio.to_thread(fs_save_user, user.id, {**u, "joined": firestore.SERVER_TIMESTAMP})
+        await asyncio.to_thread(db_save_user, user.id, {**u, "joined": time.time()})
         return u, True
     changed = {}
     name, uname = (user.first_name or "User")[:40], user.username or ""
@@ -725,7 +840,7 @@ async def register_user(user, ref: int | None = None):
     if u.get("username") != uname:
         u["username"] = changed["username"] = uname
     if changed:
-        await asyncio.to_thread(fs_save_user, user.id, changed)
+        await asyncio.to_thread(db_save_user, user.id, changed)
     return u, False
 
 
@@ -735,13 +850,13 @@ async def credit_referral(bot, uid: int):
     if not u or not u.get("ref_by") or u.get("credited"):
         return
     u["credited"] = True
-    await asyncio.to_thread(fs_save_user, uid, {"credited": True})
+    await asyncio.to_thread(db_save_user, uid, {"credited": True})
     r = TGU.get(u["ref_by"])
     if not r:
         return
     r["points"] += REF["points"]
     r["refs"] += 1
-    await asyncio.to_thread(fs_save_user, u["ref_by"], {"points": r["points"], "refs": r["refs"]})
+    await asyncio.to_thread(db_save_user, u["ref_by"], {"points": r["points"], "refs": r["refs"]})
     try:
         await bot.send_message(
             u["ref_by"],
@@ -918,128 +1033,120 @@ async def on_user_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show(update, leaderboard_text(user.id), kb([[B("🎁 Refer & Earn", "u:ref"), B("💰 Balance", "u:bal")], nav]))
 
 
-# ------------------------------------------------------------------ admin: link remove
-def pick_remove(cat: str, mode: str) -> list[dict]:
-    """mode: '1' / '50' = the newest N links, 'all' = everything in the category."""
-    items = sorted(CACHE[cat], key=num_of)
-    return items if mode == "all" else items[-int(mode) :]
-
-
+# ------------------------------------------------------------------ admin: link remove (by keyword)
 def preview_lines(items: list[dict], limit=6) -> str:
-    rows = [f"#{num_of(x)} {short(x['title'] or x['url'], 38)}" for x in items[-limit:]]
+    rows = [f"#{num_of(x)} {short(x['title'] or x['url'], 38)}" for x in items[:limit]]
     more = f"\n… +{len(items) - limit} aur" if len(items) > limit else ""
     return "\n".join(rows) + more
 
 
-async def do_remove(cat: str, items: list[dict]):
-    async with ADD_LOCK:
-        await asyncio.to_thread(fs_delete_docs, cat, [x["doc"] for x in items])
-        gone = {x["id"] for x in items}
-        CACHE[cat] = [x for x in CACHE[cat] if x["id"] not in gone]
-        CACHE_URLS[cat] = {x["url"] for x in CACHE[cat]}
+async def do_remove(items: list[dict]):
+    await asyncio.to_thread(db_delete_links, [x["id"] for x in items])
 
 
 async def admin_link_remove(update, context, cmd, parts):
     ud = context.user_data
     if cmd == "lr":
         ud.clear()
-        await show(update, f"🗑 Link Remove\n{LINE}\nKis category se remove karna hai? 👇", cat_kb("lrc", counts=True))
-    elif cmd == "lrc":
-        cat = parts[1]
-        if cat not in CATEGORIES:
+        if not db_keywords():
+            await show(update, f"🗑 Link Remove\n{LINE}\nDB abhi khali hai. Koi link nahi.", kb([BACK]))
             return
+        await show(update, f"🗑 Link Remove\n{LINE}\nKis search se remove karna hai? 👇", kw_kb("lrc"))
+        return
+    kw = kw_by_hid(parts[1]) if len(parts) > 1 else ud.get("kw")
+    if cmd in ("lre2", "lre3"):
+        kw = ud.get("kw")
+    if not kw:
+        await show(update, "Ye search ab DB mein nahi hai.", kb([[B("⬅️ Back", "lr")]]))
+        return
+    h = hid_of(kw)
+    if cmd == "lrc":
         ud.clear()
-        n = len(CACHE[cat])
-        if not n:
-            await show(update, f"{tag(cat)}\n\nIs category mein koi link nahi hai.", kb([[B("⬅️ Back", "lr")]]))
-            return
+        n = db_count(kw)
         await show(
             update,
-            f"🗑 {tag(cat)} · {n} links\n{LINE}\nKitne remove karne hain? 👇\n(naye wale pehle hatenge)",
+            f"🗑 {tag(kw)} · {n} links\n{LINE}\nKitne remove karne hain? 👇\n(naye wale pehle hatenge)",
             kb(
                 [
-                    [B("🗑 Last 1", f"lrn:{cat}:1"), B("🗑 Last 50", f"lrn:{cat}:50")],
-                    [B(f"🧨 All ({n})", f"lrn:{cat}:all")],
-                    [B("🎯 Link / Number se", f"lro:{cat}")],
+                    [B("🗑 Last 1", f"lrn:{h}:1"), B("🗑 Last 50", f"lrn:{h}:50")],
+                    [B(f"🧨 All ({n})", f"lrn:{h}:all")],
+                    [B("🎯 Link / Number se", f"lro:{h}")],
                     [B("⬅️ Back", "lr")],
                 ]
             ),
         )
     elif cmd in ("lrn", "lrn2", "lrn3"):
-        cat, mode = parts[1], parts[2]
-        if cat not in CATEGORIES or mode not in ("1", "50", "all"):
+        mode = parts[2]
+        if mode not in ("1", "50", "all"):
             return
-        items = pick_remove(cat, mode)
+        items = db_newest(kw, None if mode == "all" else int(mode))
         if not items:
-            await show(update, "Remove karne ke liye kuch nahi bacha.", kb([[B("⬅️ Back", f"lrc:{cat}")]]))
+            await show(update, "Remove karne ke liye kuch nahi bacha.", kb([[B("⬅️ Back", "lr")]]))
             return
         if cmd == "lrn":
             await show(
                 update,
-                f"⚠️ Confirm (1/2)\n\n{tag(cat)} se {len(items)} link remove karna hai?\n\n{preview_lines(items)}",
-                kb([[B("✅ Haan", f"lrn2:{cat}:{mode}"), B("⬅️ Nahi", f"lrc:{cat}")]]),
+                f"⚠️ Confirm (1/2)\n\n{tag(kw)} se {len(items)} link remove karna hai?\n\n{preview_lines(items)}",
+                kb([[B("✅ Haan", f"lrn2:{h}:{mode}"), B("⬅️ Nahi", f"lrc:{h}")]]),
             )
         elif cmd == "lrn2":
             await show(
                 update,
-                f"🚨 Final confirm (2/2)\n\n{tag(cat)} ke {len(items)} link PERMANENT delete honge.\nYe wapas nahi aa sakta.",
-                kb([[B(f"🗑 Delete {len(items)}", f"lrn3:{cat}:{mode}"), B("❌ Cancel", f"lrc:{cat}")]]),
+                f"🚨 Final confirm (2/2)\n\n{tag(kw)} ke {len(items)} link PERMANENT delete honge.\nYe wapas nahi aa sakta.",
+                kb([[B(f"🗑 Delete {len(items)}", f"lrn3:{h}:{mode}"), B("❌ Cancel", f"lrc:{h}")]]),
             )
         else:
-            await do_remove(cat, items)
+            await do_remove(items)
             await show(
                 update,
-                f"✅ {len(items)} link remove ho gaye\n{tag(cat)}: ab {len(CACHE[cat])} links",
-                kb([[B("⬅️ Back", f"lrc:{cat}"), B("🏠 Menu", "m")]]),
+                f"✅ {len(items)} link remove ho gaye\n{tag(kw)}: ab {db_count(kw)} links",
+                kb([[B("⬅️ Back", "lr"), B("🏠 Menu", "m")]]),
             )
     elif cmd == "lro":
-        cat = parts[1]
-        if cat not in CATEGORIES:
-            return
         ud.clear()
-        ud["cat"], ud["mode"] = cat, "rm_one"
+        ud["kw"], ud["mode"] = kw, "rm_one"
         await show(
             update,
-            f"🎯 {tag(cat)}\n\nNumber (jaise #15) ya link bhejo.\nEk se zyada bhi chalega, har line mein ek.",
-            kb([[B("⬅️ Back", f"lrc:{cat}")]]),
+            f"🎯 {tag(kw)}\n\nNumber (jaise #15) ya link bhejo.\nEk se zyada bhi chalega, har line mein ek.",
+            kb([[B("⬅️ Back", f"lrc:{h}")]]),
         )
     elif cmd in ("lre2", "lre3"):
-        cat, ids = ud.get("cat"), ud.get("rm_ids")
-        if not cat or not ids:
+        ids = ud.get("rm_ids")
+        if not ids:
             await show(update, "Session khatam. Dubara try karo.", kb([[B("⬅️ Back", "lr")]]))
             return
-        items = [x for x in CACHE[cat] if x["id"] in ids]
+        items = [x for x in db_newest(kw, None) if x["id"] in ids]
         if cmd == "lre2":
             await show(
                 update,
                 f"🚨 Final confirm (2/2)\n\n{len(items)} link PERMANENT delete honge.\nYe wapas nahi aa sakta.",
-                kb([[B(f"🗑 Delete {len(items)}", "lre3"), B("❌ Cancel", f"lrc:{cat}")]]),
+                kb([[B(f"🗑 Delete {len(items)}", "lre3"), B("❌ Cancel", f"lrc:{h}")]]),
             )
         else:
-            await do_remove(cat, items)
+            await do_remove(items)
             ud.clear()
             await show(
                 update,
-                f"✅ {len(items)} link remove ho gaye\n{tag(cat)}: ab {len(CACHE[cat])} links",
-                kb([[B("⬅️ Back", f"lrc:{cat}"), B("🏠 Menu", "m")]]),
+                f"✅ {len(items)} link remove ho gaye\n{tag(kw)}: ab {db_count(kw)} links",
+                kb([[B("⬅️ Back", "lr"), B("🏠 Menu", "m")]]),
             )
 
 
 async def rm_one_input(update, context, text):
     ud = context.user_data
-    cat = ud.get("cat")
-    nav = kb([[B("⬅️ Back", f"lrc:{cat}"), B("🏠 Menu", "m")]])
+    kw = ud.get("kw")
+    nav = kb([[B("⬅️ Back", f"lrc:{hid_of(kw)}"), B("🏠 Menu", "m")]])
     nums = {int(n) for n in re.findall(r"(?<![\w/])#?(\d{1,9})(?![\w/])", " ".join(l for l in text.splitlines() if not URL_RE.search(l)))}
     urls = {u.rstrip(").,;]}>") for u in URL_RE.findall(text)}
-    items = [x for x in CACHE[cat] if num_of(x) in nums or x["url"] in urls]
+    items = db_match(kw, nums, urls)
     if not items:
         await update.message.reply_text("❌ Koi match nahi mila. Number ya sahi link bhejo.", reply_markup=nav)
         return
     ud["rm_ids"] = {x["id"] for x in items}
     ud.pop("mode", None)
     await update.message.reply_text(
-        f"⚠️ Confirm (1/2)\n\n{tag(cat)} se {len(items)} link remove karna hai?\n\n{preview_lines(items)}",
-        reply_markup=kb([[B("✅ Haan", "lre2"), B("⬅️ Nahi", f"lrc:{cat}")]]),
+        f"⚠️ Confirm (1/2)\n\n{tag(kw)} se {len(items)} link remove karna hai?\n\n{preview_lines(items)}",
+        reply_markup=kb([[B("✅ Haan", "lre2"), B("⬅️ Nahi", f"lrc:{hid_of(kw)}")]]),
     )
 
 
@@ -1052,8 +1159,8 @@ async def render_web(update: Update, page: int = 0):
     lines = [f"{page * WEB_PAGE + i}. {short((x['title'] + ' · ' if x.get('title') else '') + x['url'], 42)}" for i, x in enumerate(chunk, 1)]
     text = (
         f"🎬 Web Start Videos ({total}/{MAX_WEB_VIDS})\n{LINE}\n"
-        "Website khulte hi ye videos chalte hain.\n\n"
-        + ("\n".join(lines) if lines else "Abhi khali hai, isliye built-in demo videos chal rahe hain.")
+        f"Website khulte hi {len(DEFAULT_VIDEOS)} built-in videos + ye videos random order mein chalte hain.\n\n"
+        + ("\n".join(lines) if lines else "Abhi koi extra video nahi. Sirf built-in videos chal rahe hain.")
     )
     rows = []
     dels = [B(f"🗑 {page * WEB_PAGE + i}", f"wsd:{hid_of(x['url'])}:{page}") for i, x in enumerate(chunk, 1)]
@@ -1097,7 +1204,7 @@ async def admin_web(update, context, cmd, parts):
             )
         else:
             WEB_VIDS.remove(x)
-            await asyncio.to_thread(fs_save_web)
+            await asyncio.to_thread(db_save_web)
             await render_web(update, page)
     elif cmd == "wsx":
         await show(
@@ -1108,12 +1215,12 @@ async def admin_web(update, context, cmd, parts):
     elif cmd == "wsx2":
         await show(
             update,
-            f"🚨 Final confirm (2/2)\n\n{len(WEB_VIDS)} videos delete honge. Website phir built-in demo videos dikhayegi.",
+            f"🚨 Final confirm (2/2)\n\n{len(WEB_VIDS)} videos delete honge. Website phir sirf built-in videos dikhayegi.",
             kb([[B("🗑 Delete all", "wsx3"), B("❌ Cancel", "ws:0")]]),
         )
     elif cmd == "wsx3":
         WEB_VIDS.clear()
-        await asyncio.to_thread(fs_save_web)
+        await asyncio.to_thread(db_save_web)
         await render_web(update, 0)
 
 
@@ -1130,7 +1237,7 @@ async def web_ingest(update, context, text):
     for u, t in take:
         WEB_VIDS.append({"url": u, "title": t})
     if take:
-        await asyncio.to_thread(fs_save_web)
+        await asyncio.to_thread(db_save_web)
     lines = [f"✅ Added: {len(take)}", f"🎬 Total: {len(WEB_VIDS)}/{MAX_WEB_VIDS}"]
     if len(entries) - len(new):
         lines.append(f"♻️ Duplicate skipped: {len(entries) - len(new)}")
@@ -1183,11 +1290,11 @@ async def admin_start_msg(update, context, cmd):
         )
     elif cmd == "smx":
         START["photo"] = ""
-        await asyncio.to_thread(fs_save_start)
+        await asyncio.to_thread(db_save_start)
         await show_start_msg(update)
     elif cmd == "smr":
         START["text"] = ""
-        await asyncio.to_thread(fs_save_start)
+        await asyncio.to_thread(db_save_start)
         await show_start_msg(update)
     elif cmd == "smp":
         await send_welcome(context.bot, q.message.chat_id, update.effective_user)  # exactly what users see
@@ -1201,7 +1308,7 @@ async def save_start_photo(update, context):
     START["photo"] = msg.photo[-1].file_id
     if msg.caption:
         START["text"] = msg.caption.strip()[:3500]
-    await asyncio.to_thread(fs_save_start)
+    await asyncio.to_thread(db_save_start)
     ud.pop("mode", None)
     await msg.reply_text(
         "✅ Banner photo save ho gayi.",
@@ -1241,7 +1348,7 @@ async def run_broadcast(app: Application, chat_id: int, status_id: int, src_chat
                 blocked += 1
                 if uid in TGU:
                     TGU[uid]["blocked"] = True
-                    await asyncio.to_thread(fs_save_user, uid, {"blocked": True})
+                    await asyncio.to_thread(db_save_user, uid, {"blocked": True})
             except Exception as e:
                 fail += 1
                 log.warning("broadcast to %s failed: %s", uid, e)
@@ -1336,7 +1443,7 @@ async def admin_force(update, context, cmd, parts):
             await update.callback_query.answer("Pehle channel add karo", show_alert=True)
             return
         FORCE["on"] = not FORCE["on"]
-        await asyncio.to_thread(fs_save_force)
+        await asyncio.to_thread(db_save_force)
         await show_force(update)
     elif cmd == "fja":
         ud.clear()
@@ -1366,7 +1473,7 @@ async def admin_force(update, context, cmd, parts):
             FORCE["channels"].pop(i)
             if not FORCE["channels"]:
                 FORCE["on"] = False
-            await asyncio.to_thread(fs_save_force)
+            await asyncio.to_thread(db_save_force)
             await show_force(update)
 
 
@@ -1416,7 +1523,7 @@ async def add_force_channel(update, context):
         await msg.reply_text("❌ Invite link nahi ban paya. Bot ko 'Invite users' permission do.", reply_markup=nav)
         return
     FORCE["channels"].append({"chat": chat.id, "title": chat.title or str(chat.id), "link": link})
-    await asyncio.to_thread(fs_save_force)
+    await asyncio.to_thread(db_save_force)
     ud.pop("mode", None)
     await msg.reply_text(
         f"✅ Added: {chat.title}\n\nForce join {'ON hai' if FORCE['on'] else 'abhi OFF hai, Force Join mein ON karo'}.",
@@ -1482,12 +1589,12 @@ async def admin_domains(update, context, cmd, parts):
         host = next((h for h in DOMAINS if hid_of(h) == parts[1]), None)
         if host:
             DOMAINS.discard(host)
-            await asyncio.to_thread(fs_remove_domain, host)
+            await asyncio.to_thread(db_remove_domain, host)
         await show(update, f"🗑 Removed: {host or '-'}", kb([[B("⬅️ Back", "dm"), B("🏠 Menu", "m")]]))
 
 
 async def render_requests(update: Update, page: int):
-    rows, has_next = await asyncio.to_thread(fs_list_requests, page)
+    rows, has_next = await asyncio.to_thread(db_list_requests, page)
     icon = {"pending": "⏳", "approved": "✅", "rejected": "❌"}
     lines, buttons = [], []
     for i, r in enumerate(rows, 1 + page * PAGE):
@@ -1518,7 +1625,7 @@ async def admin_requests(update, context, cmd, parts):
         ud.clear()
         await render_requests(update, int(parts[1]))
     elif cmd == "ra1":
-        host = await asyncio.to_thread(fs_get_host, parts[1])
+        host = await asyncio.to_thread(db_get_host, parts[1])
         p = parts[2]
         await show(
             update,
@@ -1526,7 +1633,7 @@ async def admin_requests(update, context, cmd, parts):
             kb([[B("✅ Haan", f"ra2:{parts[1]}:{p}"), B("⬅️ Back", f"rq:{p}")]]),
         )
     elif cmd == "ra2":
-        host = await asyncio.to_thread(fs_get_host, parts[1])
+        host = await asyncio.to_thread(db_get_host, parts[1])
         p = parts[2]
         await show(
             update,
@@ -1534,33 +1641,35 @@ async def admin_requests(update, context, cmd, parts):
             kb([[B("✅ Confirm approve", f"ra3:{parts[1]}:{p}"), B("❌ Cancel", f"rq:{p}")]]),
         )
     elif cmd == "ra3":
-        host = await asyncio.to_thread(fs_get_host, parts[1])
+        host = await asyncio.to_thread(db_get_host, parts[1])
         if host:
-            await asyncio.to_thread(fs_add_domain, host)
+            await asyncio.to_thread(db_add_domain, host)
             DOMAINS.add(host)
         await render_requests(update, int(parts[2]))
     elif cmd == "rr":
-        host = await asyncio.to_thread(fs_get_host, parts[1])
+        host = await asyncio.to_thread(db_get_host, parts[1])
         if host:
             DOMAINS.discard(host)
-            await asyncio.to_thread(fs_remove_domain, host)
+            await asyncio.to_thread(db_remove_domain, host)
         await render_requests(update, int(parts[2]))
 
 
 async def admin_status(update, context):
     context.user_data.clear()
-    lines, total = [], 0
-    for cat in CATEGORIES:
-        c = len(CACHE[cat])
-        total += c
-        lines.append(f"{tag(cat)}: {c}")
-    pending = await asyncio.to_thread(fs_pending_count)
-    web_users = await asyncio.to_thread(fs_count_users)
+    kws = db_keywords()
+    total = sum(k["n"] for k in kws)
+    lines = [f"{tag(k['search'])}: {k['n']}" for k in kws[:15]] or ["DB abhi khali hai"]
+    if len(kws) > 15:
+        lines.append(f"… +{len(kws) - 15} aur search")
+    pending = await asyncio.to_thread(db_pending_count)
+    web_users = await asyncio.to_thread(db_count_users)
     blocked = sum(1 for x in TGU.values() if x.get("blocked"))
     refs = sum(x.get("refs", 0) for x in TGU.values())
+    working = ", ".join(SEARCHING) or "-"
     text = (
-        f"📊 Status\n{LINE}\n" + "\n".join(lines) + f"\n\n🔗 Total links: {total}\n"
-        f"🎬 Web start videos: {len(WEB_VIDS)}\n"
+        f"📊 Status\n{LINE}\n" + "\n".join(lines) + f"\n\n🔗 Total links: {total}  ({len(kws)} search)\n"
+        f"⏳ link_file kaam kar raha hai: {working}\n"
+        f"🎬 Web start videos: {len(DEFAULT_VIDEOS)} built-in + {len(WEB_VIDS)} extra\n"
         f"🌐 Approved domains: {len(DOMAINS)}   ⏳ Pending: {pending}\n"
         f"👤 Web users (own PIN): {web_users}\n\n"
         f"🤖 Bot users: {len(TGU)}  (🚫 blocked {blocked})\n"
@@ -1588,37 +1697,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     elif cmd == "uv":  # see the bot exactly like a normal user
         await send_welcome(context.bot, q.message.chat_id, update.effective_user)
-
-    # ---- link add: category -> method -> input
-    elif cmd == "la":
-        ud.clear()
-        await show(update, f"➕ Link Add\n{LINE}\nKis category mein add karna hai? 👇", cat_kb("lc", counts=True))
-    elif cmd == "lc":
-        cat = parts[1]
-        if cat not in CATEGORIES:
-            return
-        ud.clear()
-        ud["cat"] = cat
-        await show(
-            update,
-            f"{tag(cat)} · {len(CACHE[cat])} links\n\nKaise add karna hai?",
-            kb([[B("📄 TXT file", "lm:txt"), B("🔗 URL", "lm:url")], [B("⬅️ Back", "la")]]),
-        )
-    elif cmd == "lm":
-        cat = ud.get("cat")
-        if not cat:
-            await show(update, home_text(), main_kb())
-            return
-        ud["mode"] = parts[1]
-        if parts[1] == "txt":
-            msg = (
-                f"{tag(cat)} · 📄 TXT\n\n.txt file bhejo.\nFormat:\n\n"
-                "mandal project 1\nhttps://site.com/a.m3u8\nmandal project 2\nhttps://site.com/b.m3u8\n\n"
-                "(title line optional hai)"
-            )
-        else:
-            msg = f"{tag(cat)} · 🔗 URL\n\nLink bhejo (ek ya zyada).\nTitle chahiye to link se pehle line mein likho."
-        await show(update, msg, kb([[B("⬅️ Back", f"lc:{cat}")]]))
 
     # ---- link remove
     elif cmd in ("lr", "lrc", "lrn", "lrn2", "lrn3", "lro", "lre2", "lre3"):
@@ -1654,37 +1732,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------ admin: messages
-async def ingest(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    cat = context.user_data.get("cat")
-    nav = kb([[B("⬅️ Back", f"lc:{cat}"), B("🏠 Menu", "m")]]) if cat else main_kb()
-    entries = parse_entries(text)
-    if not entries:
-        await update.message.reply_text("❌ Koi valid link nahi mila.", reply_markup=nav)
-        return
-    status = await update.message.reply_text(f"⏳ {len(entries)} link save ho rahe hain…")
-    try:
-        async with ADD_LOCK:
-            r = await asyncio.to_thread(store_links, cat, entries)
-            for it in r["items"]:  # keep the RAM cache in sync, no re-read needed
-                CACHE[cat].append(it)
-                CACHE_URLS[cat].add(it["url"])
-            if r["last"]:
-                CACHE_MAXN[cat] = max(CACHE_MAXN[cat], r["last"])
-    except Exception as e:
-        log.exception("Firestore write failed")
-        await status.edit_text(f"⚠️ Firebase error:\n{e}", reply_markup=nav)
-        return
-    titled = sum(1 for it in r["items"] if it["title"])
-    lines = [tag(cat), f"✅ Added: {len(r['items'])}"]
-    if r["items"]:
-        lines.append(f"🔢 Numbers: #{r['first']} – #{r['last']}")
-        lines.append(f"🏷 Title ke saath: {titled}")
-    if r["dup"]:
-        lines.append(f"♻️ Duplicate skipped: {r['dup']}")
-    lines.append("\nAur bhejo, ya Back dabao.")
-    await status.edit_text("\n".join(lines), reply_markup=nav)
-
-
 async def read_input(update: Update):
     """Text of the message, or the content of a .txt file. None (after a reply) when it is neither."""
     msg = update.message
@@ -1724,7 +1771,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not host:
             await msg.reply_text("❌ Domain sahi nahi hai. Example: https://my_project_vercel.app", reply_markup=nav)
             return
-        await asyncio.to_thread(fs_add_domain, host)
+        await asyncio.to_thread(db_add_domain, host)
         DOMAINS.add(host)
         await msg.reply_text(f"✅ Domain added:\n{host}", reply_markup=nav)
     elif mode == "smsg":
@@ -1732,7 +1779,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("✏️ Text bhejo.")
             return
         START["text"] = text[:3500]
-        await asyncio.to_thread(fs_save_start)
+        await asyncio.to_thread(db_save_start)
         ud.pop("mode", None)
         await msg.reply_text(
             "✅ Start message saved.\n\nNormal user ab /start karega to ye dikhega.",
@@ -1743,17 +1790,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❌ 0 se 1000 ke beech number bhejo.")
             return
         REF["points"] = int(text)
-        await asyncio.to_thread(fs_save_refer)
+        await asyncio.to_thread(db_save_refer)
         ud.pop("mode", None)
         await msg.reply_text(
             f"✅ Ab har refer par {REF['points']} points milenge.", reply_markup=kb([[B("🎁 Refer", "rf"), B("🏠 Menu", "m")]])
         )
-    elif mode == "rm_one" and ud.get("cat"):
+    elif mode == "rm_one" and ud.get("kw"):
         await rm_one_input(update, context, text)
-    elif mode in ("txt", "url") and ud.get("cat"):
-        data = await read_input(update)
-        if data is not None:
-            await ingest(update, context, data)
     elif mode == "ws_add":
         data = await read_input(update)
         if data is not None:
@@ -1764,8 +1807,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------------ startup
 async def post_init(app: Application):
-    global ADD_LOCK
-    ADD_LOCK = asyncio.Lock()
     await asyncio.to_thread(load_all)
 
     api = web.Application(middlewares=[cors_mw])
@@ -1795,13 +1836,9 @@ async def post_shutdown(app: Application):
 
 
 def main():
-    global db
-    for name, val in (("BOT_TOKEN", BOT_TOKEN), ("KEY_64", KEY_64), ("FIREBASE_B64", FIREBASE_B64)):
+    for name, val in (("BOT_TOKEN", BOT_TOKEN), ("KEY_64", KEY_64)):
         if "PASTE_" in val:
             raise SystemExit(f"Set {name} (environment variable or at the top of bot.py).")
-    cred = credentials.Certificate(json.loads(base64.b64decode(FIREBASE_B64)))
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", start))

@@ -166,7 +166,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       </div>
       <div id="brand"></div>
       <div class="topr">
-        <button class="ib" id="favBtn" aria-label="Add to favorites" aria-pressed="false"><svg class="i" id="favIcon"><use href="#i-heart"/></svg></button>
+        <button class="ib" id="favBtn" aria-label="Add to favorites" aria-pressed="false" hidden><svg class="i" id="favIcon"><use href="#i-heart"/></svg></button>
         <button class="ib" id="searchBtn" aria-label="Search" hidden><svg class="i"><use href="#i-search"/></svg></button>
         <div class="menu-wrap" id="menuWrap" hidden>
           <button class="ib" id="menuBtn" aria-label="Open menu" aria-expanded="false"><svg class="i"><use href="#i-list"/></svg></button>
@@ -185,7 +185,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     <div id="rail">
       <button class="rb" id="muteBtn" aria-label="Sound"><span class="c"><svg class="i" id="muteIcon"><use href="#i-mute"/></svg></span>Sound</button>
       <button class="rb" id="rotateBtn" aria-label="Landscape"><span class="c"><svg class="i" id="rotIcon"><use href="#i-rotate"/></svg></span><span id="rotLabel">Rotate</span></button>
-      <button class="rb" id="favsBtn" aria-label="Open favorites"><span class="c"><svg class="i"><use href="#i-bookmark"/></svg><b class="badge" id="favBadge" hidden>0</b></span>Favs</button>
+      <button class="rb" id="favsBtn" aria-label="Open favorites" hidden><span class="c"><svg class="i"><use href="#i-bookmark"/></svg><b class="badge" id="favBadge" hidden>0</b></span>Favs</button>
       <button class="rb" id="nextBtn" aria-label="Next reel"><span class="c"><svg class="i"><use href="#i-down"/></svg></span>Next</button>
     </div>
     <div id="scrub" aria-label="Seek">
@@ -275,7 +275,7 @@ const CATS = {
     reels[i].classList.remove('off'); scrub.classList.remove('open');
     if (i >= STREAMS.length - 2) loadMore();
     $('brand').textContent = STREAMS[i].title || ''; updateFavUI();
-    load(vid(i), STREAMS[i].url);
+    startItem(i);
   }
   function play(v){ const p = v.play(); if (p && p.catch) p.catch(() => toast('Tap to play')); }
   function failStream(my, msg){          // dead / blocked link: say why, then go to the next video
@@ -284,12 +284,41 @@ const CATS = {
     const n = my + 1;
     if (n < reels.length) setTimeout(() => { if (active === my) feed.scrollTo({top:n * feed.clientHeight, behavior:'smooth'}); }, 1500);
   }
+  /* Favorites keep only the video PAGE url. The stream url is fetched when you play and kept for 1 hour. */
+  async function streamFor(s, force){
+    const f = s.page ? favs.find(x => x.page === s.page) : null, c = f || s;
+    if (!force && c.s && c.e > Date.now() + 60000) return c.s;       // still valid (1 hr)
+    const r = await api('/api/resolve', {page:s.page, force:!!force}, true);
+    c.s = r.url; c.e = r.exp; s.url = r.url;
+    if (f) saveFavs();
+    return r.url;
+  }
+  async function startItem(i, force){
+    const s = STREAMS[i]; if (!s) return;
+    let url = s.url;
+    if (s.page && (force || !url)){
+      $('spinner').classList.add('on');
+      try { url = await streamFor(s, force); }
+      catch (e){
+        if (active !== i) return;
+        if (e.code === 'bad_token'){ exitSecret(); fail(e); return; }
+        failStream(i, ERR[e.code] || 'Could not get the video link'); return;
+      }
+    }
+    if (active !== i) return;
+    load(vid(i), url);
+  }
+  function retryOrFail(my, msg){          // expired / dead stream of a saved page: get a fresh one once
+    const s = STREAMS[my];
+    if (active === my && s && s.page && !s.retried){ s.retried = true; release(my); startItem(my, true); return; }
+    failStream(my, msg);
+  }
   function load(v, url){
     const my = active; let tries = 0;
     $('spinner').classList.add('on'); setProg(0); $('tCur').textContent = '0:00';
     v.muted = muted;
     clearTimeout(wd);
-    wd = setTimeout(() => { if (active === my && v.paused && v.readyState < 3) failStream(my, 'Stream is too slow or blocked'); }, 20000);
+    wd = setTimeout(() => { if (active === my && v.paused && v.readyState < 3) retryOrFail(my, 'Stream is too slow or blocked'); }, 20000);
     if (window.Hls && Hls.isSupported()){
       hls = new Hls({manifestLoadingMaxRetry:1, levelLoadingMaxRetry:2, fragLoadingMaxRetry:3});
       hls.loadSource(url); hls.attachMedia(v);
@@ -299,10 +328,10 @@ const CATS = {
         if (d.type === Hls.ErrorTypes.NETWORK_ERROR){
           if (++tries <= 2){ toast('Network problem. Retrying…'); hls.startLoad(); return; }
           const c = d.response && d.response.code;
-          failStream(my, c ? 'Link error (HTTP ' + c + ')' : 'Link blocked or offline');
+          retryOrFail(my, c ? 'Link error (HTTP ' + c + ')' : 'Link blocked or offline');
         }
-        else if (d.type === Hls.ErrorTypes.MEDIA_ERROR){ if (++tries <= 2) hls.recoverMediaError(); else failStream(my, 'This video cannot be played'); }
-        else failStream(my, 'This stream cannot be played');
+        else if (d.type === Hls.ErrorTypes.MEDIA_ERROR){ if (++tries <= 2) hls.recoverMediaError(); else retryOrFail(my, 'This video cannot be played'); }
+        else retryOrFail(my, 'This stream cannot be played');
       });
     } else if (v.canPlayType('application/vnd.apple.mpegurl')){
       v.src = url; v.addEventListener('loadedmetadata', () => play(v), {once:true});
@@ -364,13 +393,14 @@ const CATS = {
   /* ---------- Favorites (max 50, saved in this browser) ---------- */
   const FAV_MAX = 50;
   let favs = [], memFavs = null, prevFilter = START_CAT, clearT;
-  try { const j = JSON.parse(localStorage.getItem('favs') || '[]'); if (Array.isArray(j)) favs = j.filter(f => f && typeof f.url === 'string').slice(0, FAV_MAX); } catch (e) {}
+  try { const j = JSON.parse(localStorage.getItem('favs') || '[]'); if (Array.isArray(j)) favs = j.filter(f => f && (typeof f.url === 'string' || typeof f.page === 'string')).slice(0, FAV_MAX); } catch (e) {}
   const esc = t => String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const favLabel = f => { if (f.title) return f.title; try { const u = new URL(f.url); return (u.host + u.pathname).slice(0, 60); } catch (e) { return f.url.slice(0, 60); } };
-  const isFav = url => favs.some(f => f.url === url);
+  const fk = x => x.page || x.url || '';
+  const favLabel = f => { if (f.title) return f.title; const k = fk(f); try { const u = new URL(k); return (u.host + u.pathname).slice(0, 60); } catch (e) { return k.slice(0, 60); } };
+  const isFav = key => favs.some(f => fk(f) === key);
   function saveFavs(){ memFavs = favs; try { localStorage.setItem('favs', JSON.stringify(favs)); } catch (e) {} updateFavUI(); }
   function updateFavUI(){
-    const s = STREAMS[active], on = !!(s && isFav(s.url)), b = $('favBtn');
+    const s = STREAMS[active], on = !!(s && isFav(fk(s))), b = $('favBtn');
     b.classList.toggle('on', on); b.setAttribute('aria-pressed', on);
     b.setAttribute('aria-label', on ? 'Remove from favorites' : 'Add to favorites');
     $('favIcon').classList.toggle('fill', on);
@@ -379,11 +409,11 @@ const CATS = {
   }
   $('favBtn').onclick = () => {
     const s = STREAMS[active]; if (!s){ toast('Nothing to save yet'); return; }
-    const i = favs.findIndex(f => f.url === s.url);
+    const i = favs.findIndex(f => fk(f) === fk(s));
     if (i >= 0){ favs.splice(i, 1); toast('Removed from favorites'); }
     else {
       if (favs.length >= FAV_MAX){ toast('Favorites full (' + FAV_MAX + '/' + FAV_MAX + '). Remove one first'); return; }
-      favs.push({url:s.url, title:s.title || '', cat:s.cat || ''}); toast('Saved to favorites (' + favs.length + '/' + FAV_MAX + ')');
+      favs.push(s.page ? {page:s.page, title:s.title || '', cat:s.cat || ''} : {url:s.url, title:s.title || '', cat:s.cat || ''});   // page url only, no stream url toast('Saved to favorites (' + favs.length + '/' + FAV_MAX + ')');
     }
     saveFavs();
     const b = $('favBtn'); b.classList.remove('pop'); void b.offsetWidth; b.classList.add('pop');
@@ -418,7 +448,7 @@ const CATS = {
     closeFav(); if (filter !== 'favs') prevFilter = filter;
     filter = 'favs'; exhausted = true;
     [...menu.children].forEach(li => li.classList.remove('on'));
-    showList(favs.map(f => ({url:f.url, title:f.title, cat:'fav'})));
+    showList(favs.map(f => ({url:f.page ? '' : f.url, page:f.page || '', title:f.title, cat:'fav'})));
     if (i > 0) feed.scrollTop = i * feed.clientHeight;
   }
   $('favExit').onclick = () => { closeFav(); if (mode === 'secret') selectCat(prevFilter || START_CAT); else showDefault(); };
@@ -470,6 +500,9 @@ const CATS = {
     bad_token:'Session expired. Enter the PIN again',
     bad_search:'Type a valid keyword (letters and numbers)',
     search_limit:'Too many new searches. Try again later',
+    resolve_failed:'Could not get the video link. Try again',
+    resolve_limit:'Too many video requests. Try again later',
+    bad_page:'This saved link is not valid',
   };
   const fail = e => toast(ERR[e.code] || 'Something went wrong');
 
@@ -548,12 +581,12 @@ const CATS = {
   }
   function enterSecret(){
     mode = 'secret';
-    $('menuWrap').hidden = false; $('searchBtn').hidden = false; $('keyBtn').classList.add('on'); $('keyBtn').setAttribute('aria-label', 'Back to default');
+    $('menuWrap').hidden = false; $('searchBtn').hidden = false; $('favBtn').hidden = false; $('favsBtn').hidden = false; $('keyBtn').classList.add('on'); $('keyBtn').setAttribute('aria-label', 'Back to default');
     selectCat(START_CAT);
   }
   function exitSecret(){
     mode = 'default'; token = null;
-    closeMenu(); closeSearch(); searchGen++; $('menuWrap').hidden = true; $('searchBtn').hidden = true; $('keyBtn').classList.remove('on'); $('keyBtn').setAttribute('aria-label', 'Enter PIN');
+    closeMenu(); closeSearch(); closeFav(); searchGen++; $('menuWrap').hidden = true; $('searchBtn').hidden = true; $('favBtn').hidden = true; $('favsBtn').hidden = true; $('keyBtn').classList.remove('on'); $('keyBtn').setAttribute('aria-label', 'Enter PIN');
     showDefault();
   }
 

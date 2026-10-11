@@ -17,3 +17,5 @@ services:
         sync: false
       - key: FIREBASE_B64
         sync: false
+      - key: WEB_URL            # optional: https://YOUR-SERVICE.onrender.com (Render fills it automatically)
+        sync: false

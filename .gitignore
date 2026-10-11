@@ -1,4 +1,6 @@
 .env
 __pycache__/
 *.pyc
-serviceAccount*.json
+data.db
+data.db-wal
+data.db-shm

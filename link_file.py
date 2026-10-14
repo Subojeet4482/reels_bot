@@ -12,6 +12,8 @@ Website par search / menu button  ->  agar DB mein us keyword ka ek bhi link nah
 on_search(keyword) ko sirf keyword milta hai ("india", "goa trip" ...), lowercase, max 40 chars.
 Bot ise alag thread mein chalata hai, max 120 sec (bot.py: LINK_TIMEOUT). Random button ki request nahi aati.
 
+(Rat source ke liye keyword "rat:<keyword>" hota hai, wo rat_source.py mein jata hai.)
+
 ==================================================================================
 2) LINK KAHAN SAVE HOTA HAI
 ==================================================================================

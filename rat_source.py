@@ -25,8 +25,10 @@ import link_file  # reuses save_links / needs_links / has_page (same DB, same 1 
 
 PREFIX = "rat:"
 LONG_PREFIX = "rat:long:"
-LONG_SEC = 300             # >= 5 min = "Long", shorter = "Short"
-LONG_BYTES = 60_000_000    # used only when the duration is unknown: >= ~60 MB = "Long"
+SHORT_MAX_SEC = 300        # Short = up to ~5 min
+LONG_MIN_SEC = 900         # Long  = full-length videos, 15 min or more (5-15 min is shown in neither list)
+SHORT_MAX_BYTES = 60_000_000    # used only when the duration is unknown: <= ~60 MB = Short
+LONG_MIN_BYTES = 200_000_000    # used only when the duration is unknown: >= ~200 MB = Long
 BASE = "https://www.rat.xxx"
 HOST_RE = re.compile(r"(^|\.)rat\.xxx$", re.I)
 
@@ -83,12 +85,13 @@ def file_size(url):
     return None
 
 
-def is_long(duration, url):
-    """True = Long, False = Short, None = could not tell."""
+def kind_of(duration=None, size=None):
+    """'short' | 'long' | None (in-between or unknown)."""
     if duration is not None:
-        return duration >= LONG_SEC
-    size = file_size(url)
-    return None if size is None else size >= LONG_BYTES
+        return "short" if duration <= SHORT_MAX_SEC else "long" if duration >= LONG_MIN_SEC else None
+    if size is not None:
+        return "short" if size <= SHORT_MAX_BYTES else "long" if size >= LONG_MIN_BYTES else None
+    return None
 
 
 def log(*a):
@@ -236,6 +239,7 @@ def on_search(keyword):
     if not key.startswith(PREFIX):
         key = PREFIX + key
     want_long = key.startswith(LONG_PREFIX)
+    want = "long" if want_long else "short"
     plain = key[len(LONG_PREFIX if want_long else PREFIX):].strip()
     if not plain:
         return
@@ -253,19 +257,18 @@ def on_search(keyword):
         if link_file.has_page(key, page):
             continue
         # duration known from the result card -> decide before resolving (saves requests)
-        if dur is not None and (dur >= LONG_SEC) != want_long:
+        if dur is not None and kind_of(dur) != want:
             skipped += 1
             continue
         tried += 1
         url = resolve_page(page)
         if not url:
             continue
-        if dur is None and not re.search(r"\.m3u8", url, re.I):
-            kind = is_long(None, url)
-            if kind is True and not want_long or kind is False and want_long:
-                skipped += 1
-                continue
-            if kind is None and want_long:  # cannot prove it is long -> not in the Long list
+        if dur is None:
+            size = None if re.search(r"\.m3u8", url, re.I) else file_size(url)
+            kind = kind_of(size=size)
+            # Long must be proven long. Short is also kept when the size is simply unknown.
+            if kind != want and not (size is None and want == "short"):
                 skipped += 1
                 continue
         saved += link_file.save_links(key, [(title, url, page)])

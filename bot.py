@@ -2,16 +2,17 @@
 """
 Telegram admin bot + website + backend  (ONE process, Telegram POLLING)
 
-Needs an always-on host (Render, Railway, VPS ...). Vercel cannot run polling.
+Needs an always-on host (Render Web Service, Railway, VPS ...). Vercel cannot run polling.
 NO Firebase: everything is stored in one local SQLite file (data.db).
+On Render: attach a Disk (mount /var/data) and set DB_PATH=/var/data/data.db, otherwise data.db is wiped on every deploy.
 
-Install:  pip install -U python-telegram-bot aiohttp
+Install:  pip install -r requirements.txt
 Run:      python bot.py
 
 Environment variables (or paste the values in CONFIG below):
   BOT_TOKEN     token from @BotFather
   ADMIN_ID      your numeric Telegram user id (ask @userinfobot)
-  KEY_64        64-char random secret: python -c "import secrets;print(secrets.token_hex(32))"
+  KEY_64        long random secret: python -c "import secrets;print(secrets.token_hex(32))"
                 (signs web sessions + salts PINs. Do NOT change it later, PINs would stop working)
   WEB_URL       (optional) public https URL of the website -> "Watch" button for users.
                 On Render it is picked up from RENDER_EXTERNAL_URL automatically.
@@ -21,10 +22,12 @@ Environment variables (or paste the values in CONFIG below):
 How links work
   Website start     -> built-in DEFAULT_VIDEOS (below) + Web Start list, in RANDOM order
   After PIN         -> "india" videos (random) + search box + menu (India/Japan/Russia/Cute/Random)
+  Source switch     -> "Stream" = link_file.py (HLS)   |   "Rat" = rat_source.py (rat.xxx download links, mp4)
+                       Rat links are stored in the same table under search = "rat:<keyword>".
   Search            -> bot reads links straight from SQLite table `links`.
                        If the keyword has no links yet, bot calls link_file.on_search(keyword)
-                       (request = "search=<keyword>"). Your code in link_file.py fetches links
-                       and saves them in the DB. Format + DB details are written in link_file.py.
+                       (or rat_source.on_search("rat:<keyword>") on the Rat source).
+                       Your code fetches links and saves them in the DB. Details are in link_file.py / rat_source.py.
 
 Admin panel (Telegram, every step has Back)
   Link Remove - by keyword (last 1 | last 50 | all | by link/number, 2x confirm)
@@ -41,13 +44,13 @@ Users (Telegram)
 Web API
   POST /api/register {pin}        -> user creates own PIN, gets uid + token
   POST /api/auth     {uid, pin}   -> login with own PIN, gets token
-  POST /api/feed     {cat,n,exclude} -> random links for keyword `cat` ("random" = mix of all)
-                                        {items, reset, searching}
+  POST /api/feed     {cat,n,exclude,src} -> random links for keyword `cat` ("random" = mix of all)
+                                        src = "stream" (default) | "rat"      {items, reset, searching}
   POST /api/defaults              -> start videos (built-in + Web Start), shuffled
-  POST /api/resolve  {page,force} -> fresh .m3u8 for a saved page url (cached 1 hr)  {url, exp}
+  POST /api/resolve  {page,force} -> fresh stream / file url for a saved page url (cached 1 hr)  {url, exp}
 
 SQLite tables (data.db)
-  links(id, search, title, url, added)   UNIQUE(search, url)
+  links(id, search, title, url, added, page)   UNIQUE(search, url)
   kv(key, value)                         start / web / force / refer settings (JSON)
   tg_users(id, data)                     bot users (JSON)
   web_users(uid, salt, hash, created)    web PIN (only a salted PBKDF2 hash)
@@ -153,6 +156,12 @@ try:
 except Exception:  # a missing / broken link_file.py must not stop the bot
     log.exception("link_file.py could not be imported (searches will only use links already in the DB)")
     link_file = None
+
+try:
+    import rat_source  # rat.xxx scraper (download links), see rat_source.py
+except Exception:
+    log.exception("rat_source.py could not be imported (Rat source disabled)")
+    rat_source = None
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 LEGACY_TITLE_RE = re.compile(r"^(Random|India|Japan|Russia|Cute) #\d+$")
@@ -263,6 +272,7 @@ def sql(query: str, args=(), fetch: str | None = None):
 
 
 def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB_PATH, timeout=30)
     try:
         c.execute("PRAGMA journal_mode=WAL")
@@ -363,7 +373,7 @@ def load_all():
     )
 
 
-# ---- links (written by link_file.py, read by the web + admin) ----
+# ---- links (written by link_file.py / rat_source.py, read by the web + admin) ----
 def db_total_links() -> int:
     return sql("SELECT COUNT(*) AS n FROM links", (), "one")["n"]
 
@@ -383,14 +393,17 @@ def db_needs_topup(kw: str) -> bool:
     return bool(fn(kw)) if fn else False
 
 
-def db_pick(kw: str, n: int, exclude: list[int]):
-    """n random links for `kw` ("random" = every keyword), never the ids in `exclude`.
-    When everything was already seen, starts over (reset=True)."""
+def db_pick(kw: str, n: int, exclude: list[int], src: str = "stream"):
+    """n random links for `kw` ("random" = every keyword of that source), never the ids in `exclude`.
+    When everything was already seen, starts over (reset=True).
+    src = "stream" (normal links) | "rat" (keywords stored as "rat:<keyword>")."""
     def q(ex):
         cond, args = ["added > ?"], [time.time() - LINK_TTL]  # expired links are never served
         if kw != "random":
             cond.append("search=?")
             args.append(kw)
+        else:  # Random: only rat links or only normal links, depending on the source switch
+            cond.append("search LIKE 'rat:%'" if src == "rat" else "search NOT LIKE 'rat:%'")
         if ex:
             cond.append("id NOT IN (" + ",".join(str(i) for i in ex) + ")")
         where = ("WHERE " + " AND ".join(cond)) if cond else ""
@@ -527,19 +540,21 @@ def default_items() -> list[dict]:
 
 
 async def run_link_file(kw: str):
-    """Calls link_file.on_search(kw) in a thread. The links it saves into the DB are picked up by the next /api/feed."""
+    """Calls link_file.on_search(kw) (or rat_source.on_search for "rat:<kw>") in a thread.
+    The links it saves into the DB are picked up by the next /api/feed."""
     SEARCHING[kw] = time.time()
     try:
-        fn = getattr(link_file, "on_search", None)
+        mod = rat_source if (kw.startswith("rat:") and rat_source) else link_file
+        fn = getattr(mod, "on_search", None)
         if not fn:
-            log.warning("link_file.on_search not found, nothing fetched for search=%s", kw)
+            log.warning("on_search not found, nothing fetched for search=%s", kw)
         else:
             log.info("request: search=%s", kw)
             await asyncio.wait_for(asyncio.to_thread(fn, kw), LINK_TIMEOUT)
     except asyncio.TimeoutError:
-        log.warning("link_file.on_search(%s) took more than %ds", kw, LINK_TIMEOUT)
+        log.warning("on_search(%s) took more than %ds", kw, LINK_TIMEOUT)
     except Exception:
-        log.exception("link_file.on_search(%s) failed", kw)
+        log.exception("on_search(%s) failed", kw)
     finally:
         SEARCHING.pop(kw, None)
         LAST_ASK[kw] = time.time()
@@ -743,13 +758,16 @@ async def api_feed(request):
     kw = norm_kw(data.get("cat") or START_SEARCH)  # "random" or a search keyword
     if not kw:
         return jerr(400, "bad_search")
+    src = "rat" if (data.get("src") == "rat" and rat_source) else "stream"
+    if src == "rat" and kw != "random":
+        kw = "rat:" + kw  # rat links live in the same table under "rat:<keyword>"
     try:
         n = max(1, min(30, int(data.get("n", 10))))
     except (TypeError, ValueError):
         n = 10
     ex = data.get("exclude")
     exclude = [int(x) for x in ex[:500] if str(x).isdigit()] if isinstance(ex, list) else []
-    items, reset = await asyncio.to_thread(db_pick, kw, n, exclude)
+    items, reset = await asyncio.to_thread(db_pick, kw, n, exclude, src)
     searching = False
     if items and kw != "random" and time.time() - TOPUP.get(kw, 0) > TOPUP_EVERY and await asyncio.to_thread(db_needs_topup, kw):
         TOPUP[kw] = time.time()  # links are about to expire: fetch new ones in the background, user keeps watching
@@ -772,12 +790,12 @@ async def api_feed(request):
     )
 
 
-RESOLVING: dict[str, asyncio.Lock] = {}  # page -> lock (one yt-dlp run per page at a time)
+RESOLVING: dict[str, asyncio.Lock] = {}  # page -> lock (one resolve per page at a time)
 RESOLVE_LOG: dict[str, list[float]] = {}  # uid -> times of fresh resolves
 
 
 async def api_resolve(request):
-    """POST {page, force?} -> {url, exp}: fresh .m3u8 for a saved video page (favorites keep only the page url).
+    """POST {page, force?} -> {url, exp}: fresh stream / file url for a saved video page (favorites keep only the page url).
     Result is cached for LINK_TTL (1 hr); exp = epoch ms when it expires."""
     host, err = await gate(request)
     if err:
@@ -788,7 +806,8 @@ async def api_resolve(request):
         return jerr(401, "bad_token")
     data = await read_json(request)
     page = str(data.get("page") or "").strip()[:500]
-    if not link_file or not hasattr(link_file, "resolve_page") or not link_file.allowed_page(page):
+    mod = rat_source if (rat_source and rat_source.allowed_page(page)) else link_file
+    if not mod or not hasattr(mod, "resolve_page") or not mod.allowed_page(page):
         return jerr(400, "bad_page")
     force = bool(data.get("force"))
     if len(RESOLVING) > 500:
@@ -804,7 +823,7 @@ async def api_resolve(request):
             return jerr(429, "resolve_limit")
         RESOLVE_LOG[uid].append(now)
         try:
-            url = await asyncio.wait_for(asyncio.to_thread(link_file.resolve_page, page), RESOLVE_TIMEOUT)
+            url = await asyncio.wait_for(asyncio.to_thread(mod.resolve_page, page), RESOLVE_TIMEOUT)
         except asyncio.TimeoutError:
             log.warning("resolve_page timed out: %s", page)
             url = None
@@ -1670,7 +1689,7 @@ async def admin_domains(update, context, cmd, parts):
         ud["mode"] = "domain"
         await show(
             update,
-            "➕ Domain bhejo\n\nExample:\nhttps://my_project_vercel.app\n\nSirf isi domain ki web ko data milega.",
+            "➕ Domain bhejo\n\nExample:\nhttps://my-project.onrender.com\n\nSirf isi domain ki web ko data milega.",
             kb([[B("⬅️ Back", "dm")]]),
         )
     elif cmd == "dd":
@@ -1766,7 +1785,7 @@ async def admin_status(update, context):
     working = ", ".join(SEARCHING) or "-"
     text = (
         f"📊 Status\n{LINE}\n" + "\n".join(lines) + f"\n\n🔗 Total links: {total}  ({len(kws)} search)\n"
-        f"⏳ link_file kaam kar raha hai: {working}\n"
+        f"⏳ Scraper kaam kar raha hai: {working}\n"
         f"🎬 Web start videos: {len(DEFAULT_VIDEOS)} built-in + {len(WEB_VIDS)} extra\n"
         f"🌐 Approved domains: {len(DOMAINS)}   ⏳ Pending: {pending}\n"
         f"👤 Web users (own PIN): {web_users}\n\n"
@@ -1867,7 +1886,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         host = norm_host(text.split()[0] if text.split() else "")
         nav = kb([[B("⬅️ Back", "dm"), B("🏠 Menu", "m")]])
         if not host:
-            await msg.reply_text("❌ Domain sahi nahi hai. Example: https://my_project_vercel.app", reply_markup=nav)
+            await msg.reply_text("❌ Domain sahi nahi hai. Example: https://my-project.onrender.com", reply_markup=nav)
             return
         await asyncio.to_thread(db_add_domain, host)
         DOMAINS.add(host)

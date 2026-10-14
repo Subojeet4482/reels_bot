@@ -77,9 +77,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .rb:active .c{transform:scale(.88)}
 #srcBtn.rat .c{color:var(--accent);border-color:var(--accent)}
 #dlBtn .c{color:#4be38a;border-color:#4be38a}
-/* Short / Long switch (top, next to Search, Rat source only) */
-#lenBtn{width:auto;min-width:62px;padding:0 14px;border-radius:22px;font-size:13px;font-weight:800;color:var(--accent);border-color:var(--accent)}
-#lenBtn.long{background:var(--accent);color:var(--ink)}
 
 
 /* Seek bar: thin by default, grows while dragging or paused */
@@ -181,7 +178,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       </div>
       <div id="brand"></div>
       <div class="topr">
-        <button class="ib" id="lenBtn" aria-label="Short or Long videos" hidden>Short</button>
         <button class="ib" id="favBtn" aria-label="Add to favorites" aria-pressed="false" hidden><svg class="i" id="favIcon"><use href="#i-heart"/></svg></button>
         <button class="ib" id="searchBtn" aria-label="Search" hidden><svg class="i"><use href="#i-search"/></svg></button>
         <div class="menu-wrap" id="menuWrap" hidden>
@@ -267,9 +263,7 @@ const CATS = {
   const vid = i => reels[i] && reels[i].querySelector('video');
   let src = 'stream';   // 'stream' = normal HLS source, 'rat' = rat.xxx download source
   const isRat = s => !!s && /^https:\/\/([^\/]*\.)?rat\.xxx\//i.test(s.page || '');
-  let len = 'short';   // 'short' | 'long' (Rat source only)
-  function setLen(v){ len = v; $('lenBtn').textContent = v === 'long' ? 'Long' : 'Short'; $('lenBtn').classList.toggle('long', v === 'long'); }
-  function setSrc(v){ src = v; $('srcLabel').textContent = v === 'rat' ? 'Rat' : 'Stream'; $('srcBtn').classList.toggle('rat', v === 'rat'); $('lenBtn').hidden = v !== 'rat'; }
+  function setSrc(v){ src = v; $('srcLabel').textContent = v === 'rat' ? 'Rat' : 'Stream'; $('srcBtn').classList.toggle('rat', v === 'rat'); }
 
   let toastT;
   function toast(m){ const t = $('toast'); t.textContent = m; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 2200); }
@@ -554,7 +548,7 @@ const CATS = {
     feed.style.scrollBehavior = 'auto'; feed.scrollTop = 0;
   }
   async function fetchBatch(key, n){
-    const r = await api('/api/feed', {cat:key, n, exclude:[...seen].slice(-300), src, len}, true);
+    const r = await api('/api/feed', {cat:key, n, exclude:[...seen].slice(-300), src}, true);
     if (r.reset) seen = new Set();   // everything was shown once, server starts over
     r.items = r.items || [];
     return r;
@@ -640,14 +634,6 @@ const CATS = {
     toast(src === 'rat' ? 'Source: Rat (download videos)' : 'Source: Stream');
     selectCat(filter === 'favs' || filter === 'default' || filter === 'link' ? START_CAT : filter);
   };
-
-  /* ---------- Short / Long (Rat) ---------- */
-  function pickLen(v){
-    if (len === v) return;
-    setLen(v); toast(v === 'long' ? 'Long videos' : 'Short videos');
-    selectCat(filter === 'favs' || filter === 'default' || filter === 'link' ? START_CAT : filter);
-  }
-  $('lenBtn').onclick = () => pickLen(len === 'long' ? 'short' : 'long');
 
   /* ---------- Download current video (rat) ---------- */
   const doDownload = async () => {

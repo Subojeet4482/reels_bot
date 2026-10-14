@@ -393,17 +393,21 @@ def db_needs_topup(kw: str) -> bool:
     return bool(fn(kw)) if fn else False
 
 
-def db_pick(kw: str, n: int, exclude: list[int], src: str = "stream"):
+def db_pick(kw: str, n: int, exclude: list[int], src: str = "stream", length: str = "short"):
     """n random links for `kw` ("random" = every keyword of that source), never the ids in `exclude`.
     When everything was already seen, starts over (reset=True).
-    src = "stream" (normal links) | "rat" (keywords stored as "rat:<keyword>")."""
+    src = "stream" (normal links) | "rat" (keywords stored as "rat:<keyword>", long ones as "rat:long:<keyword>").
+    length = "short" | "long" (rat source only)."""
     def q(ex):
         cond, args = ["added > ?"], [time.time() - LINK_TTL]  # expired links are never served
         if kw != "random":
             cond.append("search=?")
             args.append(kw)
         else:  # Random: only rat links or only normal links, depending on the source switch
-            cond.append("search LIKE 'rat:%'" if src == "rat" else "search NOT LIKE 'rat:%'")
+            if src == "rat":
+                cond.append("search LIKE 'rat:long:%'" if length == "long" else "search LIKE 'rat:%' AND search NOT LIKE 'rat:long:%'")
+            else:
+                cond.append("search NOT LIKE 'rat:%'")
         if ex:
             cond.append("id NOT IN (" + ",".join(str(i) for i in ex) + ")")
         where = ("WHERE " + " AND ".join(cond)) if cond else ""
@@ -759,15 +763,17 @@ async def api_feed(request):
     if not kw:
         return jerr(400, "bad_search")
     src = "rat" if (data.get("src") == "rat" and rat_source) else "stream"
+    length = "long" if (src == "rat" and data.get("len") == "long") else "short"
     if src == "rat" and kw != "random":
-        kw = "rat:" + kw  # rat links live in the same table under "rat:<keyword>"
+        # rat links live in the same table: short = "rat:<keyword>", long = "rat:long:<keyword>"
+        kw = ("rat:long:" if length == "long" else "rat:") + kw
     try:
         n = max(1, min(30, int(data.get("n", 10))))
     except (TypeError, ValueError):
         n = 10
     ex = data.get("exclude")
     exclude = [int(x) for x in ex[:500] if str(x).isdigit()] if isinstance(ex, list) else []
-    items, reset = await asyncio.to_thread(db_pick, kw, n, exclude, src)
+    items, reset = await asyncio.to_thread(db_pick, kw, n, exclude, src, length)
     searching = False
     if items and kw != "random" and time.time() - TOPUP.get(kw, 0) > TOPUP_EVERY and await asyncio.to_thread(db_needs_topup, kw):
         TOPUP[kw] = time.time()  # links are about to expire: fetch new ones in the background, user keeps watching

@@ -77,6 +77,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .rb:active .c{transform:scale(.88)}
 #srcBtn.rat .c{color:var(--accent);border-color:var(--accent)}
 #dlBtn .c{color:#4be38a;border-color:#4be38a}
+/* Short / Long switch (top, Rat source only) */
+#lenBar{position:absolute;z-index:2;top:calc(62px + var(--st));left:50%;transform:translateX(-50%);display:flex;gap:2px;padding:3px;background:var(--glass);border:1px solid var(--line);border-radius:99px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+#lenBar button{border:0;background:none;padding:7px 18px;border-radius:99px;font-size:13px;font-weight:800;cursor:pointer;color:#cfd5e6;transition:background .15s,color .15s}
+#lenBar button.on{background:var(--accent);color:var(--ink)}
+#lenBar button.dl{color:#4be38a;padding:7px 12px;display:inline-flex;align-items:center}
 
 
 /* Seek bar: thin by default, grows while dragging or paused */
@@ -98,7 +103,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 #lockOverlay.on{display:block}
 #unlockBtn{position:absolute;z-index:6;top:calc(10px + var(--st));left:calc(10px + var(--sl));width:auto;border-radius:22px;padding:0 16px;gap:8px;background:var(--glass2);opacity:0;visibility:hidden;transition:opacity .25s,visibility .25s;font-weight:700;font-size:13px}
 #unlockBtn.on{opacity:1;visibility:visible}
-#toast{position:absolute;z-index:8;left:50%;top:calc(66px + var(--st));transform:translate(-50%,-6px);padding:8px 14px;border-radius:99px;background:var(--glass2);border:1px solid var(--line);font-size:13px;font-weight:600;opacity:0;pointer-events:none;transition:.2s;white-space:nowrap;max-width:94%;overflow:hidden;text-overflow:ellipsis}
+#toast{position:absolute;z-index:8;left:50%;top:calc(108px + var(--st));transform:translate(-50%,-6px);padding:8px 14px;border-radius:99px;background:var(--glass2);border:1px solid var(--line);font-size:13px;font-weight:600;opacity:0;pointer-events:none;transition:.2s;white-space:nowrap;max-width:94%;overflow:hidden;text-overflow:ellipsis}
 #toast.on{opacity:1;transform:translate(-50%,0)}
 
 /* Add-link sheet */
@@ -187,6 +192,12 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       </div>
     </div>
 
+    <div id="lenBar" role="group" aria-label="Video length" hidden>
+      <button id="lenShort" class="on" aria-pressed="true">Short</button>
+      <button id="lenLong" aria-pressed="false">Long</button>
+      <button id="lenDl" class="dl" aria-label="Download video" hidden><svg class="i" style="width:18px;height:18px"><use href="#i-download"/></svg></button>
+    </div>
+
     <div id="zoom">
       <button class="ib" id="zoomIn" aria-label="Zoom in"><svg class="i"><use href="#i-plus"/></svg></button>
       <button id="zoomLevel" aria-label="Reset zoom">1.0x</button>
@@ -264,7 +275,9 @@ const CATS = {
   const vid = i => reels[i] && reels[i].querySelector('video');
   let src = 'stream';   // 'stream' = normal HLS source, 'rat' = rat.xxx download source
   const isRat = s => !!s && /^https:\/\/([^\/]*\.)?rat\.xxx\//i.test(s.page || '');
-  function setSrc(v){ src = v; $('srcLabel').textContent = v === 'rat' ? 'Rat' : 'Stream'; $('srcBtn').classList.toggle('rat', v === 'rat'); }
+  let len = 'short';   // 'short' | 'long' (Rat source only)
+  function setLen(v){ len = v; $('lenShort').classList.toggle('on', v === 'short'); $('lenLong').classList.toggle('on', v === 'long'); $('lenShort').setAttribute('aria-pressed', v === 'short'); $('lenLong').setAttribute('aria-pressed', v === 'long'); }
+  function setSrc(v){ src = v; $('srcLabel').textContent = v === 'rat' ? 'Rat' : 'Stream'; $('srcBtn').classList.toggle('rat', v === 'rat'); $('lenBar').hidden = v !== 'rat'; }
 
   let toastT;
   function toast(m){ const t = $('toast'); t.textContent = m; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 2200); }
@@ -439,7 +452,7 @@ const CATS = {
     b.setAttribute('aria-label', on ? 'Remove from favorites' : 'Add to favorites');
     $('favIcon').classList.toggle('fill', on);
     $('favBadge').textContent = favs.length; $('favBadge').hidden = !favs.length;
-    $('dlBtn').hidden = !(s && isRat(s));
+    $('dlBtn').hidden = !(s && isRat(s)); $('lenDl').hidden = $('dlBtn').hidden;
     $('favCount').textContent = favs.length + '/' + FAV_MAX;
   }
   $('favBtn').onclick = () => {
@@ -550,7 +563,7 @@ const CATS = {
     feed.style.scrollBehavior = 'auto'; feed.scrollTop = 0;
   }
   async function fetchBatch(key, n){
-    const r = await api('/api/feed', {cat:key, n, exclude:[...seen].slice(-300), src}, true);
+    const r = await api('/api/feed', {cat:key, n, exclude:[...seen].slice(-300), src, len}, true);
     if (r.reset) seen = new Set();   // everything was shown once, server starts over
     r.items = r.items || [];
     return r;
@@ -637,8 +650,17 @@ const CATS = {
     selectCat(filter === 'favs' || filter === 'default' || filter === 'link' ? START_CAT : filter);
   };
 
+  /* ---------- Short / Long (Rat) ---------- */
+  function pickLen(v){
+    if (len === v) return;
+    setLen(v); toast(v === 'long' ? 'Long videos' : 'Short videos');
+    selectCat(filter === 'favs' || filter === 'default' || filter === 'link' ? START_CAT : filter);
+  }
+  $('lenShort').onclick = () => pickLen('short');
+  $('lenLong').onclick = () => pickLen('long');
+
   /* ---------- Download current video (rat) ---------- */
-  $('dlBtn').onclick = async () => {
+  const doDownload = async () => {
     const s = STREAMS[active]; if (!s) return;
     toast('Download link la raha hu…');
     try {
@@ -654,6 +676,7 @@ const CATS = {
       else toast(ERR[e.code] || 'Download link nahi mila');
     }
   };
+  $('dlBtn').onclick = doDownload; $('lenDl').onclick = doDownload;
 
   /* ---------- Search box ---------- */
   const searchSheet = $('searchSheet'), searchIn = $('searchInput');

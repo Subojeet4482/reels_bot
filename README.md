@@ -23,7 +23,8 @@ Bot ke liye `starter` plan chahiye.
 ## Website
 - PIN (4 digit, apna banao) dalo -> menu, search, Favs, Source, Download khulte hain.
 - **Source** button: `Stream` (purana HLS) <-> `Rat` (rat.xxx download videos).
-- **Download** button: sirf Rat videos par; seedha file ka link kholta hai.
+- **Short / Long** switch: top me (title ke neeche), sirf Rat source me dikhta hai. Short = chhote videos, Long = lambe videos (>= 5 min).
+- **Download** button: sirf Rat videos par; seedha file ka link kholta hai. Ab top ke Short/Long bar me bhi hai (green icon) aur neeche rail me bhi.
 - Search box me rat.xxx link paste kar sakte ho:
   - `https://www.rat.xxx/download/16424`           -> wo video chalega + download
   - `https://www.rat.xxx/search/?q=ret+xxx+full`   -> "ret xxx full" search (Rat source)
@@ -32,3 +33,8 @@ Bot ke liye `starter` plan chahiye.
 ## Rat scraper tune karna
 Site ka HTML mujhe check karne ko nahi mila, isliye `rat_source.py` generic hai.
 Search se kuch na aaye to logs me `[rat_source]` lines dekho aur `SEARCH_URLS`, `parse_results()`, `pick_file()` adjust karo.
+
+## Short / Long tune karna
+`rat_source.py` ke top me `LONG_SEC` (default 300 = 5 min) aur `LONG_BYTES` (duration na mile to file size se, default 60 MB) badal sakte ho.
+Long list me sirf wahi video aati hai jiska length pakka pata chale (result card ki duration ya file size). Long me kam results aaye to `PAGES_LONG` badhao.
+DB me Long videos `rat:long:<keyword>` key se save hote hain.

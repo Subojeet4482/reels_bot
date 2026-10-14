@@ -77,11 +77,9 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .rb:active .c{transform:scale(.88)}
 #srcBtn.rat .c{color:var(--accent);border-color:var(--accent)}
 #dlBtn .c{color:#4be38a;border-color:#4be38a}
-/* Short / Long switch (top, Rat source only) */
-#lenBar{position:absolute;z-index:2;top:calc(62px + var(--st));left:50%;transform:translateX(-50%);display:flex;gap:2px;padding:3px;background:var(--glass);border:1px solid var(--line);border-radius:99px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
-#lenBar button{border:0;background:none;padding:7px 18px;border-radius:99px;font-size:13px;font-weight:800;cursor:pointer;color:#cfd5e6;transition:background .15s,color .15s}
-#lenBar button.on{background:var(--accent);color:var(--ink)}
-#lenBar button.dl{color:#4be38a;padding:7px 12px;display:inline-flex;align-items:center}
+/* Short / Long switch (top, next to Search, Rat source only) */
+#lenBtn{width:auto;min-width:62px;padding:0 14px;border-radius:22px;font-size:13px;font-weight:800;color:var(--accent);border-color:var(--accent)}
+#lenBtn.long{background:var(--accent);color:var(--ink)}
 
 
 /* Seek bar: thin by default, grows while dragging or paused */
@@ -103,7 +101,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 #lockOverlay.on{display:block}
 #unlockBtn{position:absolute;z-index:6;top:calc(10px + var(--st));left:calc(10px + var(--sl));width:auto;border-radius:22px;padding:0 16px;gap:8px;background:var(--glass2);opacity:0;visibility:hidden;transition:opacity .25s,visibility .25s;font-weight:700;font-size:13px}
 #unlockBtn.on{opacity:1;visibility:visible}
-#toast{position:absolute;z-index:8;left:50%;top:calc(108px + var(--st));transform:translate(-50%,-6px);padding:8px 14px;border-radius:99px;background:var(--glass2);border:1px solid var(--line);font-size:13px;font-weight:600;opacity:0;pointer-events:none;transition:.2s;white-space:nowrap;max-width:94%;overflow:hidden;text-overflow:ellipsis}
+#toast{position:absolute;z-index:8;left:50%;top:calc(66px + var(--st));transform:translate(-50%,-6px);padding:8px 14px;border-radius:99px;background:var(--glass2);border:1px solid var(--line);font-size:13px;font-weight:600;opacity:0;pointer-events:none;transition:.2s;white-space:nowrap;max-width:94%;overflow:hidden;text-overflow:ellipsis}
 #toast.on{opacity:1;transform:translate(-50%,0)}
 
 /* Add-link sheet */
@@ -183,6 +181,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       </div>
       <div id="brand"></div>
       <div class="topr">
+        <button class="ib" id="lenBtn" aria-label="Short or Long videos" hidden>Short</button>
         <button class="ib" id="favBtn" aria-label="Add to favorites" aria-pressed="false" hidden><svg class="i" id="favIcon"><use href="#i-heart"/></svg></button>
         <button class="ib" id="searchBtn" aria-label="Search" hidden><svg class="i"><use href="#i-search"/></svg></button>
         <div class="menu-wrap" id="menuWrap" hidden>
@@ -190,12 +189,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
           <ul id="menu" role="menu"></ul>
         </div>
       </div>
-    </div>
-
-    <div id="lenBar" role="group" aria-label="Video length" hidden>
-      <button id="lenShort" class="on" aria-pressed="true">Short</button>
-      <button id="lenLong" aria-pressed="false">Long</button>
-      <button id="lenDl" class="dl" aria-label="Download video" hidden><svg class="i" style="width:18px;height:18px"><use href="#i-download"/></svg></button>
     </div>
 
     <div id="zoom">
@@ -211,7 +204,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       <button class="rb" id="favsBtn" aria-label="Open favorites" hidden><span class="c"><svg class="i"><use href="#i-bookmark"/></svg><b class="badge" id="favBadge" hidden>0</b></span>Favs</button>
       <button class="rb" id="srcBtn" aria-label="Switch source" hidden><span class="c"><svg class="i"><use href="#i-swap"/></svg></span><span id="srcLabel">Stream</span></button>
       <button class="rb" id="dlBtn" aria-label="Download video" hidden><span class="c"><svg class="i"><use href="#i-download"/></svg></span>Download</button>
-      <button class="rb" id="nextBtn" aria-label="Next reel"><span class="c"><svg class="i"><use href="#i-down"/></svg></span>Next</button>
     </div>
     <div id="scrub" aria-label="Seek">
       <div class="stime"><span id="tCur">0:00</span> / <span id="tDur">0:00</span></div>
@@ -276,8 +268,8 @@ const CATS = {
   let src = 'stream';   // 'stream' = normal HLS source, 'rat' = rat.xxx download source
   const isRat = s => !!s && /^https:\/\/([^\/]*\.)?rat\.xxx\//i.test(s.page || '');
   let len = 'short';   // 'short' | 'long' (Rat source only)
-  function setLen(v){ len = v; $('lenShort').classList.toggle('on', v === 'short'); $('lenLong').classList.toggle('on', v === 'long'); $('lenShort').setAttribute('aria-pressed', v === 'short'); $('lenLong').setAttribute('aria-pressed', v === 'long'); }
-  function setSrc(v){ src = v; $('srcLabel').textContent = v === 'rat' ? 'Rat' : 'Stream'; $('srcBtn').classList.toggle('rat', v === 'rat'); $('lenBar').hidden = v !== 'rat'; }
+  function setLen(v){ len = v; $('lenBtn').textContent = v === 'long' ? 'Long' : 'Short'; $('lenBtn').classList.toggle('long', v === 'long'); }
+  function setSrc(v){ src = v; $('srcLabel').textContent = v === 'rat' ? 'Rat' : 'Stream'; $('srcBtn').classList.toggle('rat', v === 'rat'); $('lenBtn').hidden = v !== 'rat'; }
 
   let toastT;
   function toast(m){ const t = $('toast'); t.textContent = m; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 2200); }
@@ -430,7 +422,6 @@ const CATS = {
 
   /* ---------- Next / keyboard ---------- */
   const goTo = i => feed.scrollTo({top:i * feed.clientHeight, behavior:'smooth'});
-  $('nextBtn').onclick = () => goTo((active + 1) % reels.length);
   feed.addEventListener('keydown', e => {
     if (e.key === 'ArrowDown'){ e.preventDefault(); goTo(Math.min(active + 1, reels.length - 1)); }
     if (e.key === 'ArrowUp'){ e.preventDefault(); goTo(Math.max(active - 1, 0)); }
@@ -452,7 +443,7 @@ const CATS = {
     b.setAttribute('aria-label', on ? 'Remove from favorites' : 'Add to favorites');
     $('favIcon').classList.toggle('fill', on);
     $('favBadge').textContent = favs.length; $('favBadge').hidden = !favs.length;
-    $('dlBtn').hidden = !(s && isRat(s)); $('lenDl').hidden = $('dlBtn').hidden;
+    $('dlBtn').hidden = !(s && isRat(s));
     $('favCount').textContent = favs.length + '/' + FAV_MAX;
   }
   $('favBtn').onclick = () => {
@@ -656,8 +647,7 @@ const CATS = {
     setLen(v); toast(v === 'long' ? 'Long videos' : 'Short videos');
     selectCat(filter === 'favs' || filter === 'default' || filter === 'link' ? START_CAT : filter);
   }
-  $('lenShort').onclick = () => pickLen('short');
-  $('lenLong').onclick = () => pickLen('long');
+  $('lenBtn').onclick = () => pickLen(len === 'long' ? 'short' : 'long');
 
   /* ---------- Download current video (rat) ---------- */
   const doDownload = async () => {
@@ -676,7 +666,7 @@ const CATS = {
       else toast(ERR[e.code] || 'Download link nahi mila');
     }
   };
-  $('dlBtn').onclick = doDownload; $('lenDl').onclick = doDownload;
+  $('dlBtn').onclick = doDownload;
 
   /* ---------- Search box ---------- */
   const searchSheet = $('searchSheet'), searchIn = $('searchInput');

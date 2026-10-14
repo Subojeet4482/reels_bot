@@ -1,67 +1,34 @@
-# Reels bot (Telegram POLLING) + website, one server. No Firebase.
+# Reels bot (Stream + Rat source)
 
-  bot.py          Telegram bot (polling) + backend API + serves the website + SQLite (data.db)
-  link_file.py    YOUR link-fetch code. Bot calls on_search(keyword) here. Format + DB are documented inside.
-  web/index.html  the player, served at /
-  requirements.txt, render.yaml
+Files
+- `bot.py`          Telegram admin bot + website backend (one process)
+- `link_file.py`    Stream source (HLS, yt-dlp)
+- `rat_source.py`   Rat source (rat.xxx download links, mp4)
+- `web/index.html`  Website (UI)
+- `render.yaml`     Render blueprint
+- `requirements.txt`
 
-Polling needs an always-on process: Render / Railway / VPS (NOT Vercel).
+## Render par deploy
+1. Ye folder GitHub repo me push karo.
+2. Render > New > Blueprint > repo chuno (render.yaml apne aap settings bhar dega).
+   Manual: Web Service, Build `pip install -r requirements.txt`, Start `python bot.py`,
+   Health check `/health`, Disk mount `/var/data`, env `DB_PATH=/var/data/data.db`.
+3. Environment me daalo: `BOT_TOKEN` (@BotFather), `ADMIN_ID` (@userinfobot), `KEY_64` (random, baad me change mat karna).
+4. Deploy ke baad site `https://<name>.onrender.com`. `WEB_URL` apne aap `RENDER_EXTERNAL_URL` se aa jata hai.
+5. Telegram me bot ko `/start` karo (admin panel).
 
-## Deploy on Render
-1. Push this folder to GitHub (bot.py in the repo root).
-2. Render > New > Web Service. Build: pip install -r requirements.txt   Start: python bot.py
-3. Environment: BOT_TOKEN, ADMIN_ID, KEY_64 (PORT is automatic)
-   KEY_64: python -c "import secrets;print(secrets.token_hex(32))"   (do not change it later)
-   WEB_URL: optional (Render sets RENDER_EXTERNAL_URL itself) -> "Watch Videos" button in the bot.
-4. /health -> ok ; / -> the player. Add a free ping to /health every 5 min (UptimeRobot) on the free plan.
-5. IMPORTANT: data.db (links, PIN users, bot users, settings) lives on the server disk.
-   Render free plan wipes the disk on every deploy/restart. For permanent data use a Render Disk
-   (paid) and set DB_PATH=/var/data/data.db, or a VPS.
+Free plan: Disk nahi milta (data.db har deploy par mitega) aur service so jati hai (Telegram polling band ho jata hai).
+Bot ke liye `starter` plan chahiye.
 
-## How the website works
-- Opens with the 25 built-in videos (DEFAULT_VIDEOS in bot.py) + Admin > Web Start videos, RANDOM order.
-- Key button -> user's own 4-digit PIN -> INDIA videos (random) start.
-- Search button (top right, after PIN) + menu (Random / India / Japan / Russia / Cute).
-- Every search is a request:  search=india | search=japan | search=<what the user typed>
-  1. Links for that keyword already in the DB -> bot returns them (random), nothing else happens.
-  2. None yet -> bot calls link_file.on_search(keyword) in a thread. Your code finds links and saves them
-     into table `links` (link_file.save_links does it). The page asks again every 4 s and plays them.
-  Limits: 10 new keywords / hour / web user, 5 keywords at once, same empty keyword retried after 2 min.
+## Website
+- PIN (4 digit, apna banao) dalo -> menu, search, Favs, Source, Download khulte hain.
+- **Source** button: `Stream` (purana HLS) <-> `Rat` (rat.xxx download videos).
+- **Download** button: sirf Rat videos par; seedha file ka link kholta hai.
+- Search box me rat.xxx link paste kar sakte ho:
+  - `https://www.rat.xxx/download/16424`           -> wo video chalega + download
+  - `https://www.rat.xxx/search/?q=ret+xxx+full`   -> "ret xxx full" search (Rat source)
+  - `https://www.rat.xxx/search/ret+xxx+full/`     -> same
 
-## link_file.py
-Ready: searches the site (DOMAINS), takes .m3u8 streams with yt-dlp, saves each link as found.
-Settings at the top: TARGET (links per keyword), BUDGET (sec), QUERY_SUFFIX ("india" -> "india popular video"), PAGES_PER_SEARCH (random result pages per search). Empty result = "No videos found".
-DB: data.db, table links(id, search, title, url, added), UNIQUE(search, url).
-
-## Search = "<keyword> popular video", random pages, Home
-- India / Japan / Russia / Cute (and any typed keyword) are searched on the site as "<keyword> popular video" (QUERY_SUFFIX in link_file.py).
-  If that gives nothing, the plain keyword is tried. The DB keyword stays "india", "japan" ...
-- Every search reads the site's total page count and picks PAGES_PER_SEARCH (6) RANDOM pages out of ALL pages (cap PAGE_CAP = 40),
-  mixes videos across those pages (one from each page in turn) -> different videos every time, not always the top page.
-- Home button (top left): after PIN = random mix of ALL keywords (one from each keyword in turn, new random pick every time / for every user);
-  before PIN = start videos again. Next/scroll keeps picking new random videos.
-- First open: "Please wait" screen until the first video plays (if the server is still waking up it keeps retrying, max 45 s).
-
-## Link expiry + Favorites (1 hr)
-- Scraped stream links (.m3u8) expire after LINK_TTL = 3600 s (env LINK_TTL). Bot deletes them every 2 min; expired links are never served.
-  Keyword with no fresh links -> link_file searches again automatically.
-- Each link also stores the video PAGE url (links.page). Favorites save ONLY the page url, never the stream url.
-- Click on a favorite -> POST /api/resolve {page} -> fresh .m3u8 (yt-dlp), cached 1 hr on server (table `resolved`) and in the favorite (browser).
-  If the stream dies early, the player fetches a new one once, automatically.
-- Top-up: when a keyword's newest batch is older than 40 min (or fewer than 5 fresh links), the bot fetches new links in the background
-  (max once per 10 min per keyword, already-fresh videos are skipped) so users never wait for a re-search at the 1 hr mark.
-- Heart + Favs buttons are visible only after PIN; without PIN nothing saved is shown.
-
-## Bot: admin panel (/start as admin)
-- Link Remove: pick a search keyword -> last 1 / last 50 / all / by number or link (2x confirm).
-  (There is no Link Add any more: links come from link_file.py.)
-- Web Start: extra start videos (added to the built-in 25). Start Msg, Broadcast, Force Join,
-  Refer System, Domain / Request / Status, User View.
-
-## Bot: users
-/start shows welcome (photo + text) and buttons: Watch Videos, Refer & Earn, Balance, Leaderboard.
-Refer link: https://t.me/<bot>?start=ref_<id>. Leaderboard = top 10 by refers.
-
-## Website on another domain (optional, e.g. Vercel)
-Put web/index.html there with  const API_BASE = 'https://YOUR-SERVICE.onrender.com';
-First use -> "New domain request" in Telegram -> Request > ✅ > confirm twice.
+## Rat scraper tune karna
+Site ka HTML mujhe check karne ko nahi mila, isliye `rat_source.py` generic hai.
+Search se kuch na aaye to logs me `[rat_source]` lines dekho aur `SEARCH_URLS`, `parse_results()`, `pick_file()` adjust karo.

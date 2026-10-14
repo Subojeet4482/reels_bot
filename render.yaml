@@ -1,19 +1,26 @@
+# Render Blueprint: New + > Blueprint > select this repo.
+# A Disk needs a paid plan (starter). Without a Disk data.db is wiped on every deploy/restart.
 services:
   - type: web
     name: reels-bot
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: BOT_TOKEN
-        sync: false
+        sync: false          # paste in the Render dashboard
       - key: ADMIN_ID
-        sync: false
+        sync: false          # your numeric Telegram id
       - key: KEY_64
-        sync: false
-      - key: WEB_URL            # optional: https://YOUR-SERVICE.onrender.com (Render fills it automatically)
-        sync: false
+        generateValue: true  # Render creates a random secret; never change it later
+      - key: DB_PATH
+        value: /var/data/data.db

@@ -31,6 +31,7 @@ import link_file  # reuses save_links / needs_links / has_page (same DB, same 1 
 PREFIX = "rat:"
 LONG_MIN_SEC = 300              # only videos longer than 5 min are kept (everything big comes, no upper limit)
 LONG_MIN_BYTES = 60_000_000     # used only when the duration is unknown: >= ~60 MB counts as long
+KEEP_UNKNOWN = True             # duration AND size both unreadable: True = still save the video, False = skip it
 BASE = "https://www.rat.xxx"
 REFERER = BASE + "/"
 HOST_RE = re.compile(r"(^|\.)rat\.xxx$", re.I)
@@ -71,19 +72,55 @@ def parse_duration(text):
 
 
 def file_size(url):
-    """Size in bytes of a direct file url (HEAD, then a 1-byte range request). None if unknown."""
+    """Size in bytes of a direct file url (HEAD, then a 1-byte range request). None if unknown (reason is logged)."""
+    reasons = []
     for method, extra in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
         try:
             req = urllib.request.Request(url, headers={**HEADERS, **extra}, method=method)
-            with urllib.request.urlopen(req, timeout=6) as r:
+            with urllib.request.urlopen(req, timeout=8) as r:
                 cr = r.headers.get("Content-Range") or ""
                 if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
                     return int(cr.rsplit("/", 1)[1])
                 cl = r.headers.get("Content-Length")
                 if cl and cl.isdigit() and int(cl) > 1:
                     return int(cl)
-        except Exception:
-            continue
+                reasons.append(f"{method}: no size header (HTTP {r.status}, type {r.headers.get('Content-Type')})")
+        except Exception as e:
+            reasons.append(f"{method}: {why(e)}")
+    err("file size not readable:", url.split("?")[0][:120], "|", " ; ".join(reasons))
+    return None
+
+
+# ---- duration of a video, read from its own page (search cards often do not show it) ----
+ISO_DUR = re.compile(r"^P(?:T)?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$", re.I)
+META_DUR = [
+    re.compile(r"""<meta[^>]+(?:property|name|itemprop)=["'](?:og:)?(?:video:)?duration["'][^>]*content=["']([^"']+)["']""", re.I),
+    re.compile(r"""<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name|itemprop)=["'](?:og:)?(?:video:)?duration["']""", re.I),
+    re.compile(r""""duration"\s*:\s*"?([^",}\s]+)"?""", re.I),
+    re.compile(r"""video_duration["']?\s*[:=]\s*["']?([\d:.]+)""", re.I),
+    re.compile(r"""(?:Duration|Length)\s*:?\s*(?:<[^>]+>\s*)*(\d{1,2}:\d{2}(?::\d{2})?)""", re.I),
+    re.compile(r"""class=["'][^"']*duration[^"']*["'][^>]*>\s*([\d:]{3,8})\s*<""", re.I),
+]
+
+
+def to_seconds(v):
+    v = (v or "").strip()
+    if re.fullmatch(r"\d+(\.\d+)?", v):
+        return int(float(v))
+    m = ISO_DUR.match(v)
+    if m and any(m.groups()):
+        h, mi, sec = m.groups()
+        return int(h or 0) * 3600 + int(mi or 0) * 60 + int(float(sec or 0))
+    return parse_duration(v)
+
+
+def duration_from_html(html):
+    for rx in META_DUR:
+        m = rx.search(html or "")
+        if m:
+            d = to_seconds(m.group(1))
+            if d:
+                return d
     return None
 
 
@@ -280,25 +317,31 @@ def mp4_from_ytdlp(page_url):
         return None
 
 
-def resolve_page(page_url):
-    """Video page url -> direct .mp4 url (None if nothing found). Fast html patterns first, yt-dlp as fallback."""
+def resolve_info(page_url):
+    """Video page url -> (direct .mp4 url or None, duration in seconds or None)."""
     if not allowed_page(page_url):
-        return None
-    url, html = None, ""
+        return None, None
+    url, html, dur = None, "", None
     try:
         html, final, ct = fetch(page_url)
         if not html:  # the url redirected straight to the file
-            return final
-        url = mp4_from_html(htmllib.unescape(html)) or pick_file(html, final)
+            return final, None
+        html = htmllib.unescape(html)
+        dur = duration_from_html(html)
+        url = mp4_from_html(html) or pick_file(html, final)
     except Exception as e:
         err("video page request failed:", page_url, "->", why(e))
-        html = ""
     if not url:
         url = mp4_from_ytdlp(page_url)
     if not url:
         hint = blocked_hint(html)
         err("no .mp4 url found on", page_url, f"(html {len(html)} bytes" + (f", block page: '{hint}'" if hint else "") + ", yt-dlp also found nothing)")
-    return url
+    return url, dur
+
+
+def resolve_page(page_url):
+    """Video page url -> direct .mp4 url (None if nothing found). Fast html patterns first, yt-dlp as fallback."""
+    return resolve_info(page_url)[0]
 
 
 # ------------------------------------------------------------------ bot request
@@ -328,16 +371,24 @@ def on_search(keyword):
             skipped += 1
             continue
         tried += 1
-        url = resolve_page(page)
+        url, pdur = resolve_info(page)
         if not url:
             continue
-        if dur is None:
-            size = None if re.search(r"\.m3u8", url, re.I) else file_size(url)
-            if size is None:
-                err("cannot read the file size (needed to know if it is long):", page)
-            if not is_long(size=size):  # too short, or cannot prove it is long
+        d = dur if dur is not None else pdur  # search card first, then the video page
+        if d is not None:
+            if not is_long(d):
                 skipped += 1
                 continue
+        else:  # no duration anywhere -> try the file size
+            size = None if re.search(r"\.m3u8", url, re.I) else file_size(url)
+            if size is not None and not is_long(size=size):
+                skipped += 1
+                continue
+            if size is None:
+                if not KEEP_UNKNOWN:
+                    skipped += 1
+                    continue
+                log("length unknown, kept anyway:", page)
         saved += link_file.save_links(key, [(title, url, page)])
         time.sleep(0.3)
     log(f"{key}: tried {tried}, saved {saved}, skipped {skipped} (not long)")

@@ -1063,6 +1063,33 @@ async def api_fav(request):
     return web.json_response({"ok": True})
 
 
+# Render free has a small monthly outbound bandwidth. Video bytes sent through /api/stream are counted and capped.
+PROXY_MAX_MB = int(os.getenv("PROXY_MAX_MB", "3000"))  # stop proxying after this many MB per month (0 = no cap)
+PROXY_USED = {"month": "", "bytes": 0}
+
+
+def proxy_month():
+    return time.strftime("%Y-%m")
+
+
+def proxy_load():
+    if PROXY_USED["month"] != proxy_month():
+        saved = kv_get("proxy_usage")
+        if saved.get("month") == proxy_month():
+            PROXY_USED.update(month=saved["month"], bytes=int(saved.get("bytes", 0)))
+        else:
+            PROXY_USED.update(month=proxy_month(), bytes=0)
+    return PROXY_USED["bytes"]
+
+
+def proxy_save():
+    kv_set("proxy_usage", {"month": PROXY_USED["month"], "bytes": PROXY_USED["bytes"]})
+
+
+def proxy_over_cap():
+    return bool(PROXY_MAX_MB) and proxy_load() >= PROXY_MAX_MB * 1_000_000
+
+
 def short_url(u):
     """file url without the query (it carries signatures) for the logs."""
     return (u or "").split("?")[0][:160]
@@ -1107,6 +1134,9 @@ async def api_stream(request):
     page = request.query.get("page", "").strip()[:500]
     if not rat_source.allowed_page(page):
         return jerr(400, "bad_page")
+    if await asyncio.to_thread(proxy_over_cap):
+        log.error("RAT stream blocked: server video bandwidth cap reached (%d MB this month). Raise PROXY_MAX_MB or wait.", PROXY_MAX_MB)
+        return jerr(429, "proxy_limit")
     dl = request.query.get("dl") == "1"
     name = re.sub(r"[^\w\- ]+", "", request.query.get("name", "")).strip()[:60] or "video"
 
@@ -1143,6 +1173,7 @@ async def api_stream(request):
     if not out:
         return jerr(502, "upstream_failed")
     session, up = out
+    sent = 0
     resp = web.StreamResponse(status=up.status)
     for h in PASS_HEADERS:
         if up.headers.get(h):
@@ -1156,6 +1187,7 @@ async def api_stream(request):
     try:
         await resp.prepare(request)
         async for chunk in up.content.iter_chunked(65536):
+            sent += len(chunk)
             await resp.write(chunk)
         await resp.write_eof()
     except (ConnectionResetError, asyncio.CancelledError):
@@ -1165,6 +1197,9 @@ async def api_stream(request):
     finally:
         up.release()
         await session.close()
+        if sent:
+            PROXY_USED["bytes"] = proxy_load() + sent
+            await asyncio.to_thread(proxy_save)
     return resp
 
 
@@ -2121,7 +2156,9 @@ async def admin_status(update, context):
         f"⏳ Scraper kaam kar raha hai: {working}\n"
         f"🎬 Web start videos: {len(DEFAULT_VIDEOS)} built-in + {len(WEB_VIDS)} extra\n"
         f"🌐 Approved domains: {len(DOMAINS)}   ⏳ Pending: {pending}\n"
-        f"👤 Web users (own PIN): {web_users}\n\n"
+        f"👤 Web users (own PIN): {web_users}\n"
+        f"📡 Server se gaya video data: {proxy_load() // 1_000_000} MB"
+        + (f" / {PROXY_MAX_MB} MB (limit)" if PROXY_MAX_MB else "") + " (is mahine)\n\n"
         f"🤖 Bot users: {len(TGU)}  (🚫 blocked {blocked})\n"
         f"🎁 Total refers: {refs}   💎 {REF['points']} pts/refer\n"
         f"🔒 Force join: {'ON' if FORCE['on'] and FORCE['channels'] else 'OFF'} ({len(FORCE['channels'])} ch)"

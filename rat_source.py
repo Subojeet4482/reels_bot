@@ -1,17 +1,22 @@
 """
-rat_source.py  -  rat.xxx source (download-link based)
+rat_source.py  -  rat.xxx source (KVS site)
 
 bot.py calls:
-    on_search("rat:<keyword>")    -> scrape search results, keep ONLY LONG videos, resolve each download page to a
-                                     direct file url, save into the SAME `links` table (search = "rat:<keyword>")
-    resolve_page(page_url)        -> fresh direct file url for a saved download page (used by Favorites + Download button)
-    allowed_page(page_url)        -> only https://*.rat.xxx/download/... pages
+    on_search("rat:<keyword>")    -> scrape search results, keep ONLY LONG videos, resolve each video page to a
+                                     direct .mp4 url, save into the SAME `links` table (search = "rat:<keyword>")
+    resolve_page(page_url)        -> fresh direct .mp4 url for a saved video page (Favorites + Download + stream proxy)
+    allowed_page(page_url)        -> only https://*.rat.xxx/videos/... pages
+    REFERER                       -> rat.xxx has hotlink protection: every request for the .mp4 file MUST carry
+                                     "Referer: https://www.rat.xxx/". bot.py's /api/stream proxy adds it.
+
+How it works (same as the working command-line script):
+    search   : https://www.rat.xxx/search/?q=<kw>&page=N        (links that contain /videos/)
+    resolve  : read the video page html and take the .mp4 url
+               (video_url / iphone_url / file = '...mp4', then <source src>, then any .mp4 link);
+               yt-dlp is the fallback when the html has nothing.
 
 Page url format that is saved in `links.page`:
-    https://www.rat.xxx/download/16424
-
-NOTE: selectors are GENERIC (the site could not be inspected). If a search returns nothing, adjust
-SEARCH_URLS / parse_results() / pick_file() below.
+    https://www.rat.xxx/videos/29369/some-title/
 """
 import html as htmllib
 import re
@@ -26,12 +31,13 @@ PREFIX = "rat:"
 LONG_MIN_SEC = 300              # only videos longer than 5 min are kept (everything big comes, no upper limit)
 LONG_MIN_BYTES = 60_000_000     # used only when the duration is unknown: >= ~60 MB counts as long
 BASE = "https://www.rat.xxx"
+REFERER = BASE + "/"
 HOST_RE = re.compile(r"(^|\.)rat\.xxx$", re.I)
 
 # {plus} = keyword with "+" for spaces. Tried in this order, the first one that gives results is used.
 SEARCH_URLS = [
-    BASE + "/search/{plus}/",       # https://www.rat.xxx/search/ret+xxx+full/
-    BASE + "/search/?q={plus}",     # https://www.rat.xxx/search/?q=ret+xxx+full
+    BASE + "/search/?q={plus}",     # https://www.rat.xxx/search/?q=ret+xxx+full&page=2   (works, used first)
+    BASE + "/search/{plus}/",       # fallback form
 ]
 TARGET = 20          # max new videos per search
 BUDGET = 90          # seconds (must stay below bot.py LINK_TIMEOUT = 120)
@@ -109,7 +115,7 @@ def allowed_page(url):
         u = urllib.parse.urlparse(url or "")
     except Exception:
         return False
-    return bool(u.scheme == "https" and u.hostname and HOST_RE.search(u.hostname) and "/download/" in u.path)
+    return bool(u.scheme == "https" and u.hostname and HOST_RE.search(u.hostname) and ("/videos/" in u.path or "/download/" in u.path))
 
 
 # ------------------------------------------------------------------ search results
@@ -136,7 +142,7 @@ class _Anchors(HTMLParser):
 
 
 def parse_results(html, base):
-    """[(title, download_page_url, duration_sec_or_None), ...] from a search-result page."""
+    """[(title, video_page_url, duration_sec_or_None), ...] from a search-result page (links that contain /videos/)."""
     p = _Anchors()
     try:
         p.feed(html)
@@ -145,13 +151,12 @@ def parse_results(html, base):
     out, seen = [], {}
     for it in p.items:
         u = urllib.parse.urljoin(base, it["href"].strip())
+        if "&amp;" in u:
+            continue
         pu = urllib.parse.urlparse(u)
-        if not pu.hostname or not HOST_RE.search(pu.hostname) or SKIP_PATH.search(pu.path):
+        if not pu.hostname or not HOST_RE.search(pu.hostname) or "/videos/" not in pu.path:
             continue
-        m = re.search(r"/download/(\d+)", pu.path) or re.search(r"(\d{3,})", pu.path)  # numeric video id
-        if not m:
-            continue
-        page = f"{BASE}/download/{m.group(1)}"
+        page = f"{BASE}{pu.path}"  # no query / fragment, always https://www.rat.xxx
         text = re.sub(r"\s+", " ", it["text"]).strip()
         dur = parse_duration(text)
         if page in seen:  # same video, another link (thumbnail + title): keep the duration if this one has it
@@ -173,9 +178,10 @@ def _page_url(template, plus, n):
 
 
 def result_pages(plus, deadline, pages=PAGES):
-    """Yields (title, download_page_url) from the first search url form that works."""
+    """Yields (title, video_page_url, duration) from the first search url form that works."""
     for tpl in SEARCH_URLS:
         got_any = False
+        first = None
         for n in range(1, pages + 1):
             if time.time() > deadline:
                 return
@@ -188,6 +194,11 @@ def result_pages(plus, deadline, pages=PAGES):
             items = parse_results(html, final)
             log(f"{url} -> {len(items)} results")
             if not items:
+                break
+            sig = {i[1] for i in items[:5]}
+            if n == 1:
+                first = sig
+            elif sig == first:  # server looped back to page 1 = no more results
                 break
             got_any = True
             for it in items:
@@ -210,18 +221,54 @@ def pick_file(html, base):
     return max(cands)[2] if cands else None
 
 
+KVS_VAR = re.compile(r"""(?:video_url|iphone_url|file)\s*[:=]\s*["'](https?://[^"']+\.mp4[^"']*)["']""")
+KVS_SOURCE = re.compile(r"""<source\s+[^>]*src=["'](https?://[^"']+\.mp4[^"']*)["']""")
+ANY_MP4 = re.compile(r"""https?://[^\s<>"']+\.mp4[^\s<>"']*""")
+
+
+def mp4_from_html(html):
+    """The three patterns of the command-line script. Returns the .mp4 url or None."""
+    html = html.replace("\\/", "/")  # json-escaped slashes: https:\/\/cdn... -> https://cdn...
+    m = KVS_VAR.search(html) or KVS_SOURCE.search(html)
+    if m:
+        return m.group(1).replace("\\/", "/")
+    links = [l.replace("\\/", "/") for l in ANY_MP4.findall(html)]
+    if links:
+        good = [l for l in links if "preview" not in l and "trailer" not in l]  # skip thumbnail / preview mp4s
+        return (good or links)[0]
+    return None
+
+
+def mp4_from_ytdlp(page_url):
+    """Fallback when the page html has no mp4 url."""
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL({"format": "best", "quiet": True, "no_warnings": True, "skip_download": True,
+                               "http_headers": {"Referer": REFERER, "User-Agent": HEADERS["User-Agent"]}}) as ydl:
+            info = ydl.extract_info(page_url, download=False)
+        u = info.get("url")
+        if not u and info.get("formats"):
+            u = info["formats"][-1].get("url")
+        return u
+    except Exception as e:
+        log("yt-dlp failed", str(e)[:80])
+        return None
+
+
 def resolve_page(page_url):
-    """Download page url -> direct file url (None if nothing found)."""
+    """Video page url -> direct .mp4 url (None if nothing found). Fast html patterns first, yt-dlp as fallback."""
     if not allowed_page(page_url):
         return None
+    url = None
     try:
         html, final, ct = fetch(page_url)
+        if not html:  # the url redirected straight to the file
+            return final
+        url = mp4_from_html(htmllib.unescape(html)) or pick_file(html, final)
     except Exception as e:
         log("resolve failed", page_url, str(e)[:80])
-        return None
-    if not html:  # the download url redirected straight to the file
-        return final
-    url = pick_file(html, final)
+    if not url:
+        url = mp4_from_ytdlp(page_url)
     if not url:
         log("no file url found on", page_url)
     return url

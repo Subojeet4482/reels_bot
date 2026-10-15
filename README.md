@@ -37,3 +37,9 @@ Search se kuch na aaye to logs me `[rat_source]` lines dekho aur `SEARCH_URLS`, 
 ## Long videos tune karna
 `rat_source.py` ke top me `LONG_MIN_SEC` (300 = 5 min) aur duration na mile to `LONG_MIN_BYTES` (file size, 60 MB) badal sakte ho.
 Sirf wahi video aati hai jiska length pakka pata chale. Kam aaye to `PAGES` badhao.
+
+## rat.xxx: Referer proxy
+rat.xxx par hotlink protection hai: .mp4 file ko `Referer: https://www.rat.xxx/` chahiye, browser ye bhej nahi sakta.
+Isliye rat videos `/api/stream` se chalte aur download hote hain: server Referer laga ke file laata hai aur browser ko bhejta hai (seek / Range chalta hai).
+Search: `https://www.rat.xxx/search/?q=<keyword>&page=N`, video pages `/videos/...`. mp4 pehle page ke html se, na mile to yt-dlp se.
+Note: video ka data aapke server se guzarta hai, isliye Render ka bandwidth use hota hai.

@@ -59,3 +59,7 @@ Note: video ka data aapke server se guzarta hai, isliye Render ka bandwidth use 
 
 ## Logs me Rat ke errors
 Render logs me `[rat_source] ERROR ...` (search 0 result / page nahi khula / mp4 nahi mila / anti-bot page) aur `RAT stream: ...` / `RAT resolve ...` (file ka HTTP status, 403 etc.) dikhte hain. Token logs me nahi aata.
+
+## Video ki length kaise pata chalti hai (Rat)
+1) search card, 2) video page ka meta / JSON-LD / "Duration" (ab ye pehle chalta hai), 3) file size (HEAD / Range request). 
+Teeno na mile to `rat_source.py` me `KEEP_UNKNOWN = True` hone par video phir bhi save hota hai (log me "length unknown, kept anyway"); `False` karoge to skip hoga.

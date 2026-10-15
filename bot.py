@@ -48,6 +48,9 @@ Web API
                                         src = "stream" (default) | "rat"      {items, reset, searching}
   POST /api/defaults              -> start videos (built-in + Web Start), shuffled
   POST /api/resolve  {page,force} -> fresh stream / file url for a saved page url (cached 1 hr)  {url, exp}
+  POST /api/react {page,url,title,val}  -> like (1) / dislike (-1) / undo (0)
+  POST /api/seen  {items}               -> watched videos (not shown again unless the admin ticks "repeat")
+  POST /api/fav   {items,on}            -> saved videos (admin can see them all)
   GET  /api/stream?page=&t=[&dl=1&name=] -> rat.xxx video through this server WITH the Referer header the site
                                        needs (hotlink protection), Range / seeking supported
 
@@ -293,6 +296,16 @@ def init_db():
             CREATE TABLE IF NOT EXISTS tg_users(id INTEGER PRIMARY KEY, data TEXT);
             CREATE TABLE IF NOT EXISTS web_users(uid TEXT PRIMARY KEY, salt TEXT, hash TEXT, created REAL);
             CREATE TABLE IF NOT EXISTS domains(host TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS reactions(
+                uid TEXT NOT NULL, vkey TEXT NOT NULL, val INTEGER NOT NULL, title TEXT DEFAULT '', ts REAL,
+                PRIMARY KEY(uid, vkey));
+            CREATE INDEX IF NOT EXISTS reactions_v ON reactions(vkey);
+            CREATE TABLE IF NOT EXISTS seen(uid TEXT NOT NULL, vkey TEXT NOT NULL, ts REAL, PRIMARY KEY(uid, vkey));
+            CREATE TABLE IF NOT EXISTS saved(
+                uid TEXT NOT NULL, vkey TEXT NOT NULL, page TEXT DEFAULT '', url TEXT DEFAULT '', title TEXT DEFAULT '',
+                ts REAL, PRIMARY KEY(uid, vkey));
+            CREATE INDEX IF NOT EXISTS saved_v ON saved(vkey);
+            CREATE TABLE IF NOT EXISTS banned(vkey TEXT PRIMARY KEY, title TEXT DEFAULT '', ts REAL);
             CREATE TABLE IF NOT EXISTS requests(
                 hid TEXT PRIMARY KEY, host TEXT, status TEXT, last REAL, count INTEGER DEFAULT 1);
             """
@@ -398,10 +411,26 @@ def db_needs_topup(kw: str) -> bool:
     return bool(fn(kw)) if fn else False
 
 
-def db_pick(kw: str, n: int, exclude: list[int], src: str = "stream"):
-    """n random links for `kw` ("random" = every keyword of that source), never the ids in `exclude`.
-    When everything was already seen, starts over (reset=True).
+VKEY = "COALESCE(NULLIF(page,''), url)"  # a video is identified by its page url (stable); old links without a page use the url
+
+
+def vkey_of(page, url):
+    return (page or url or "").strip()[:500]
+
+
+def repeat_seen() -> bool:
+    """Admin tick: True = videos a user already watched may come again."""
+    return bool(kv_get("web_settings").get("repeat_seen"))
+
+
+def db_pick(kw: str, n: int, exclude: list[int], src: str = "stream", uid: str = ""):
+    """n links for `kw` ("random" = every keyword of that source), never the ids in `exclude`.
+    Order: videos this user LIKED first, then the rest (random), videos this user DISLIKED last.
+    Never: banned videos, and (unless the admin ticked "repeat") videos this user already watched.
+    When everything was already seen in this session, starts over (reset=True).
     src = "stream" (normal links) | "rat" (keywords stored as "rat:<keyword>", long videos only)."""
+    again = repeat_seen()
+
     def q(ex):
         cond, args = ["added > ?"], [time.time() - LINK_TTL]  # expired links are never served
         if kw != "random":
@@ -411,23 +440,150 @@ def db_pick(kw: str, n: int, exclude: list[int], src: str = "stream"):
             cond.append("search LIKE 'rat:%'" if src == "rat" else "search NOT LIKE 'rat:%'")
         if ex:
             cond.append("id NOT IN (" + ",".join(str(i) for i in ex) + ")")
-        where = ("WHERE " + " AND ".join(cond)) if cond else ""
+        cond.append(f"{VKEY} NOT IN (SELECT vkey FROM banned)")
+        if uid and not again:  # watched before -> not again (liked videos are the exception)
+            cond.append(
+                f"({VKEY} NOT IN (SELECT vkey FROM seen WHERE uid=?) OR {VKEY} IN (SELECT vkey FROM reactions WHERE uid=? AND val=1))"
+            )
+            args += [uid, uid]
+        where = "WHERE " + " AND ".join(cond)
+        # 0 = liked, 1 = normal, 2 = disliked (goes last)
+        pri = (
+            f"CASE (SELECT val FROM reactions r WHERE r.uid=? AND r.vkey={VKEY}) WHEN 1 THEN 0 WHEN -1 THEN 2 ELSE 1 END"
+        )
         if kw == "random":  # Home/Random: mix of ALL keywords, one from each keyword in turn (not only the biggest one)
             try:
                 return sql(
-                    "SELECT id, search, title, url, page FROM (SELECT *, ROW_NUMBER() OVER "
-                    f"(PARTITION BY search ORDER BY RANDOM()) AS rk FROM links {where}) ORDER BY rk, RANDOM() LIMIT ?",
-                    (*args, n),
+                    f"SELECT id, search, title, url, page, pri FROM (SELECT *, {pri} AS pri, "
+                    f"ROW_NUMBER() OVER (PARTITION BY search ORDER BY RANDOM()) AS rk FROM links {where}) "
+                    "ORDER BY pri, rk, RANDOM() LIMIT ?",
+                    (uid, *args, n),
                     "all",
                 )
             except sqlite3.OperationalError:  # very old SQLite without window functions
                 pass
-        return sql(f"SELECT id, search, title, url, page FROM links {where} ORDER BY RANDOM() LIMIT ?", (*args, n), "all")
+        return sql(
+            f"SELECT id, search, title, url, page, {pri} AS pri FROM links {where} ORDER BY pri, RANDOM() LIMIT ?",
+            (uid, *args, n),
+            "all",
+        )
 
     rows = q(exclude)
     if rows or not exclude:
         return rows, False
     return q([]), True
+
+
+# ---- likes / dislikes / watched / saved (per web user) ----
+def db_react(uid, vkey, val, title=""):
+    """val: 1 like, -1 dislike, 0 remove."""
+    if not vkey:
+        return
+    if val == 0:
+        sql("DELETE FROM reactions WHERE uid=? AND vkey=?", (uid, vkey))
+    else:
+        sql("INSERT OR REPLACE INTO reactions(uid, vkey, val, title, ts) VALUES (?,?,?,?,?)", (uid, vkey, val, title[:120], time.time()))
+
+
+def db_mark_seen(uid, vkeys):
+    now = time.time()
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        c.executemany("INSERT OR IGNORE INTO seen(uid, vkey, ts) VALUES (?,?,?)", [(uid, k, now) for k in vkeys if k])
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_set_saved(uid, vkey, on, page="", url="", title=""):
+    if not vkey:
+        return
+    if on:
+        sql(
+            "INSERT OR REPLACE INTO saved(uid, vkey, page, url, title, ts) VALUES (?,?,?,?,?,?)",
+            (uid, vkey, page[:500], "" if page else url[:500], title[:120], time.time()),
+        )
+    else:
+        sql("DELETE FROM saved WHERE uid=? AND vkey=?", (uid, vkey))
+
+
+def db_my_marks(uid, vkeys):
+    """{vkey: 1 | -1} for the given videos (what this user already liked / disliked)."""
+    out = {}
+    for i in range(0, len(vkeys), 400):
+        part = vkeys[i : i + 400]
+        rows = sql(
+            "SELECT vkey, val FROM reactions WHERE uid=? AND vkey IN (%s)" % ",".join("?" * len(part)), (uid, *part), "all"
+        )
+        out.update({r["vkey"]: r["val"] for r in rows})
+    return out
+
+
+def db_like_stats(order, limit, offset):
+    """[{vkey, title, likes, dislikes, saves}] ordered by likes (order='likes'), dislikes ('dislikes') or saves ('saves')."""
+    col = {"likes": "likes", "dislikes": "dislikes", "saves": "saves"}[order]
+    return sql(
+        "SELECT vkey, MAX(title) AS title, SUM(val=1) AS likes, SUM(val=-1) AS dislikes, "
+        "(SELECT COUNT(*) FROM saved s WHERE s.vkey=r.vkey) AS saves FROM reactions r GROUP BY vkey "
+        f"HAVING {col} > 0 ORDER BY {col} DESC, MAX(ts) DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+        "all",
+    )
+
+
+def db_like_count(order):
+    col = {"likes": "SUM(val=1)", "dislikes": "SUM(val=-1)"}[order]
+    r = sql(f"SELECT COUNT(*) AS n FROM (SELECT vkey FROM reactions GROUP BY vkey HAVING {col} > 0)", (), "one")
+    return r["n"] if r else 0
+
+
+def db_saved_stats(limit, offset):
+    return sql(
+        "SELECT vkey, MAX(title) AS title, MAX(page) AS page, MAX(url) AS url, COUNT(*) AS saves, MAX(ts) AS ts "
+        "FROM saved GROUP BY vkey ORDER BY saves DESC, ts DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+        "all",
+    )
+
+
+def db_saved_count():
+    r = sql("SELECT COUNT(DISTINCT vkey) AS n FROM saved", (), "one")
+    return r["n"] if r else 0
+
+
+def db_vkey_by_hid(h):
+    for t in ("reactions", "saved", "banned"):
+        for r in sql(f"SELECT DISTINCT vkey FROM {t}", (), "all"):
+            if hid_of(r["vkey"]) == h:
+                return r["vkey"]
+    return None
+
+
+def db_clear_dislikes(vkey=None):
+    """Admin 'restart': the dislike is removed (one video, or all) and the video counts as not watched again."""
+    keys = [vkey] if vkey else db_disliked_keys()
+    for i in range(0, len(keys), 400):
+        part = keys[i : i + 400]
+        ph = ",".join("?" * len(part))
+        sql(f"DELETE FROM seen WHERE vkey IN ({ph})", part)
+        sql(f"DELETE FROM reactions WHERE val=-1 AND vkey IN ({ph})", part)
+    return len(keys)
+
+
+def db_ban(vkeys, title=""):
+    now = time.time()
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        for k in vkeys:
+            t = c.execute("SELECT MAX(title) FROM reactions WHERE vkey=?", (k,)).fetchone()[0] or title
+            c.execute("INSERT OR REPLACE INTO banned(vkey, title, ts) VALUES (?,?,?)", (k, t or "", now))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_disliked_keys():
+    return [r["vkey"] for r in sql("SELECT DISTINCT vkey FROM reactions WHERE val=-1", (), "all")]
 
 
 def db_newest(kw: str, n: int | None) -> list[dict]:
@@ -772,7 +928,7 @@ async def api_feed(request):
         n = 10
     ex = data.get("exclude")
     exclude = [int(x) for x in ex[:500] if str(x).isdigit()] if isinstance(ex, list) else []
-    items, reset = await asyncio.to_thread(db_pick, kw, n, exclude, src)
+    items, reset = await asyncio.to_thread(db_pick, kw, n, exclude, src, uid)
     searching = False
     if items and kw != "random" and time.time() - TOPUP.get(kw, 0) > TOPUP_EVERY and await asyncio.to_thread(db_needs_topup, kw):
         TOPUP[kw] = time.time()  # links are about to expire: fetch new ones in the background, user keeps watching
@@ -788,7 +944,10 @@ async def api_feed(request):
             "reset": reset,
             "searching": searching,
             "items": [
-                {"id": x["id"], "url": x["url"], "page": x.get("page") or "", "title": clean_title(x["title"]), "cat": x["search"]}
+                {
+                    "id": x["id"], "url": x["url"], "page": x.get("page") or "", "title": clean_title(x["title"]),
+                    "cat": x["search"], "mark": {0: 1, 2: -1}.get(x.get("pri"), 0),  # 1 = you liked it, -1 = you disliked it
+                }
                 for x in items
             ],
         }
@@ -837,9 +996,76 @@ async def api_resolve(request):
             log.exception("resolve_page failed: %s", page)
             url = None
         if not url:
+            log.error("RAT resolve_failed (api_resolve): %s", page) if mod is rat_source else None
             return jerr(502, "resolve_failed")
         exp = await asyncio.to_thread(db_set_resolved, page, url)
     return web.json_response({"ok": True, "url": url, "exp": int(exp * 1000)})
+
+
+async def web_uid(request):
+    """(uid, None) for a logged-in website user, else (None, error response)."""
+    host, err = await gate(request)
+    if err:
+        return None, err
+    auth = request.headers.get("Authorization", "")
+    uid = check_token(auth[7:], host) if auth.startswith("Bearer ") else None
+    return (uid, None) if uid else (None, jerr(401, "bad_token"))
+
+
+def clean_item(x):
+    """(vkey, page, url, title) from a client item, or None."""
+    if not isinstance(x, dict):
+        return None
+    page = str(x.get("page") or "").strip()[:500]
+    url = str(x.get("url") or "").strip()[:500]
+    if page and not page.startswith("https://"):
+        page = ""
+    vk = vkey_of(page, url)
+    return (vk, page, url, clean_title(x.get("title"))) if vk else None
+
+
+async def api_react(request):
+    """POST {page,url,title,val} val: 1 like | -1 dislike | 0 undo."""
+    uid, err = await web_uid(request)
+    if err:
+        return err
+    data = await read_json(request)
+    it = clean_item(data)
+    val = data.get("val")
+    if not it or val not in (1, -1, 0):
+        return jerr(400, "bad_item")
+    await asyncio.to_thread(db_react, uid, it[0], val, it[3])
+    return web.json_response({"ok": True})
+
+
+async def api_seen(request):
+    """POST {items:[{page,url}]} -> these videos were watched, they will not come again (unless the admin allows it)."""
+    uid, err = await web_uid(request)
+    if err:
+        return err
+    data = await read_json(request)
+    items = [clean_item(x) for x in (data.get("items") or [])[:50]]
+    await asyncio.to_thread(db_mark_seen, uid, [i[0] for i in items if i])
+    return web.json_response({"ok": True})
+
+
+async def api_fav(request):
+    """POST {items:[{page,url,title}], on:true|false} -> the user's saved (favorite) videos, so the admin can see them."""
+    uid, err = await web_uid(request)
+    if err:
+        return err
+    data = await read_json(request)
+    on = bool(data.get("on", True))
+    items = [clean_item(x) for x in (data.get("items") or [])[:100]]
+    for i in items:
+        if i:
+            await asyncio.to_thread(db_set_saved, uid, i[0], on, i[1], i[2], i[3])
+    return web.json_response({"ok": True})
+
+
+def short_url(u):
+    """file url without the query (it carries signatures) for the logs."""
+    return (u or "").split("?")[0][:160]
 
 
 RAT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -856,9 +1082,14 @@ async def rat_file_url(page, force=False):
                 return hit[0]
         try:
             url = await asyncio.wait_for(asyncio.to_thread(rat_source.resolve_page, page), RESOLVE_TIMEOUT)
-        except Exception:
-            log.warning("rat resolve failed: %s", page)
+        except asyncio.TimeoutError:
+            log.error("RAT resolve timed out after %ds: %s", RESOLVE_TIMEOUT, page)
             return None
+        except Exception:
+            log.exception("RAT resolve crashed: %s", page)
+            return None
+        if not url:
+            log.error("RAT resolve found no video file: %s", page)
         if url:
             await asyncio.to_thread(db_set_resolved, page, url)
         return url
@@ -890,16 +1121,20 @@ async def api_stream(request):
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=40))
         try:
             up = await session.get(url, headers=headers, allow_redirects=True)
-        except Exception:
+        except Exception as e:
+            log.error("RAT stream: cannot reach the file (%s: %s) page=%s file=%s", type(e).__name__, e, page, short_url(url))
             await session.close()
             if attempt:
                 return jerr(502, "upstream_failed")
             continue
         if up.status in (403, 404, 410) and not attempt:
+            log.warning("RAT stream: file answered HTTP %s, resolving again... page=%s", up.status, page)
             up.release()
             await session.close()
             continue
         if up.status >= 400:
+            log.error("RAT stream: file answered HTTP %s (%s) page=%s file=%s%s", up.status, up.reason, page, short_url(url),
+                      "  <- hotlink protection: Referer was sent, maybe the link is tied to an IP / cookie" if up.status == 403 else "")
             up.release()
             await session.close()
             return jerr(502, "upstream_" + str(up.status))
@@ -923,8 +1158,10 @@ async def api_stream(request):
         async for chunk in up.content.iter_chunked(65536):
             await resp.write(chunk)
         await resp.write_eof()
-    except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientError):
+    except (ConnectionResetError, asyncio.CancelledError):
         pass  # the viewer closed / seeked: normal
+    except aiohttp.ClientError as e:
+        log.warning("RAT stream interrupted (%s: %s) page=%s", type(e).__name__, e, page)
     finally:
         up.release()
         await session.close()
@@ -989,6 +1226,7 @@ def main_kb():
             [B("🔒 Force Join", "fj"), B("🎁 Refer System", "rf")],
             [B("🌐 Domain", "dm"), B("📨 Request", "rq:0")],
             [B("📊 Status", "st"), B("👁 User View", "uv")],
+            [B("👍 Likes / 👎 Dislikes / 💾 Saved", "rx")],
         ]
     )
 
@@ -1891,6 +2129,146 @@ async def admin_status(update, context):
     await show(update, text, kb([[B("🔄 Refresh", "st")], BACK]))
 
 
+# ------------------------------------------------------------------ admin: likes / dislikes / saved / repeat
+RX_PAGE = 8
+
+
+def vlabel(x, n=44):
+    return short(x.get("title") or x.get("page") or x.get("vkey") or x.get("url") or "?", n)
+
+
+def nav_row(prefix, page, pages):
+    row = []
+    if page > 0:
+        row.append(B("◀️ Prev", f"{prefix}:{page - 1}"))
+    if page < pages - 1:
+        row.append(B("Next ▶️", f"{prefix}:{page + 1}"))
+    return row
+
+
+async def admin_react(update, context, cmd, parts):
+    ud = context.user_data
+    ud.clear()
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+    if cmd in ("rx", "rxr"):
+        if cmd == "rxr":
+            st = kv_get("web_settings")
+            st["repeat_seen"] = not st.get("repeat_seen")
+            await asyncio.to_thread(kv_set, "web_settings", st)
+        again = await asyncio.to_thread(repeat_seen)
+        likes, dislikes, saved, banned = await asyncio.gather(
+            asyncio.to_thread(db_like_count, "likes"),
+            asyncio.to_thread(db_like_count, "dislikes"),
+            asyncio.to_thread(db_saved_count),
+            asyncio.to_thread(lambda: sql("SELECT COUNT(*) AS n FROM banned", (), "one")["n"]),
+        )
+        text = (
+            f"👍 Likes / 👎 Dislikes / 💾 Saved\n{LINE}\n"
+            f"👍 Liked videos: {likes}\n👎 Disliked videos: {dislikes}\n💾 Saved videos: {saved}\n🚫 Banned videos: {banned}\n\n"
+            f"🔁 Purane (dekhe hue) videos dobara: {'☑️ ON - dobara aayenge' if again else '⬜ OFF - dobara nahi aayenge'}\n\n"
+            "• Liked video user ke feed me sabse upar, disliked sabse last me.\n"
+            "• Dekha hua video agle din dobara nahi aata (jab tak ye tick ON na ho)."
+        )
+        rows = [
+            [B("👍 Likes", "lk:0"), B("💾 Saved", "sv:0")],
+            [B("👎 Dislikes", "dl:0"), B("🚫 Banned", "bn:0")],
+            [B(("☑️" if again else "⬜") + " Purane videos dobara dikhao", "rxr")],
+            BACK,
+        ]
+        await show(update, text, kb(rows))
+        return
+
+    if cmd == "lk":
+        total = await asyncio.to_thread(db_like_count, "likes")
+        pages = max(1, -(-total // RX_PAGE))
+        page = max(0, min(page, pages - 1))
+        rows_ = await asyncio.to_thread(db_like_stats, "likes", RX_PAGE, page * RX_PAGE)
+        lines = [
+            f"{page * RX_PAGE + i}. 👍 {x['likes']}  👎 {x['dislikes']}  💾 {x['saves']}\n   {vlabel(x)}\n   {short(x['vkey'], 60)}"
+            for i, x in enumerate(rows_, 1)
+        ]
+        text = f"👍 Kis video me kitne likes ({total})\n{LINE}\n" + ("\n".join(lines) if lines else "Abhi koi like nahi.")
+        nav = nav_row("lk", page, pages)
+        await show(update, text, kb(([nav] if nav else []) + [[B("⬅️ Back", "rx")]]))
+
+    elif cmd == "sv":
+        total = await asyncio.to_thread(db_saved_count)
+        pages = max(1, -(-total // RX_PAGE))
+        page = max(0, min(page, pages - 1))
+        rows_ = await asyncio.to_thread(db_saved_stats, RX_PAGE, page * RX_PAGE)
+        lines = [
+            f"{page * RX_PAGE + i}. 💾 {x['saves']} user\n   {vlabel(x)}\n   {short(x.get('page') or x.get('url') or x['vkey'], 70)}"
+            for i, x in enumerate(rows_, 1)
+        ]
+        text = f"💾 Sabke saved videos ({total})\n{LINE}\n" + ("\n".join(lines) if lines else "Abhi koi saved video nahi.")
+        nav = nav_row("sv", page, pages)
+        await show(update, text, kb(([nav] if nav else []) + [[B("⬅️ Back", "rx")]]))
+
+    elif cmd in ("dl", "dlr", "dlb"):
+        if cmd in ("dlr", "dlb"):  # one video: restart (dislikes cleared, shown again) or ban (never again, for everyone)
+            vk = await asyncio.to_thread(db_vkey_by_hid, parts[1])
+            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            if vk and cmd == "dlr":
+                await asyncio.to_thread(db_clear_dislikes, vk)
+            elif vk:
+                await asyncio.to_thread(db_ban, [vk])
+                await asyncio.to_thread(db_clear_dislikes, vk)
+        total = await asyncio.to_thread(db_like_count, "dislikes")
+        pages = max(1, -(-total // RX_PAGE))
+        page = max(0, min(page, pages - 1))
+        rows_ = await asyncio.to_thread(db_like_stats, "dislikes", RX_PAGE, page * RX_PAGE)
+        lines = [f"{page * RX_PAGE + i}. 👎 {x['dislikes']}  👍 {x['likes']}\n   {vlabel(x)}\n   {short(x['vkey'], 60)}" for i, x in enumerate(rows_, 1)]
+        text = (
+            f"👎 Disliked videos ({total})\n{LINE}\n" + ("\n".join(lines) if lines else "Abhi koi dislike nahi.")
+            + "\n\n♻️ = phir se start (dislike hat jata hai)\n🚫 = poori tarah ban (kisi ko nahi dikhega)"
+        )
+        btn = []
+        for i, x in enumerate(rows_, 1):
+            h = hid_of(x["vkey"])
+            btn.append([B(f"♻️ {page * RX_PAGE + i}", f"dlr:{h}:{page}"), B(f"🚫 {page * RX_PAGE + i}", f"dlb:{h}:{page}")])
+        nav = nav_row("dl", page, pages)
+        if nav:
+            btn.append(nav)
+        if total:
+            btn.append([B("♻️ Sab restart", "dlra"), B("🚫 Sab ban", "dlba")])
+        btn.append([B("⬅️ Back", "rx")])
+        await show(update, text, kb(btn))
+
+    elif cmd in ("dlra", "dlba"):
+        n = await asyncio.to_thread(lambda: len(db_disliked_keys()))
+        what = "restart (sab dislike hat jayenge)" if cmd == "dlra" else "BAN (sab disliked videos kabhi nahi dikhenge)"
+        await show(update, f"⚠️ {n} disliked videos ko {what} karna hai?", kb([[B("✅ Haan", cmd + "2"), B("❌ Nahi", "dl:0")]]))
+
+    elif cmd in ("dlra2", "dlba2"):
+        keys = await asyncio.to_thread(db_disliked_keys)
+        if cmd == "dlba2":
+            await asyncio.to_thread(db_ban, keys)
+        await asyncio.to_thread(db_clear_dislikes)
+        await show(update, f"✅ {len(keys)} videos {'ban ho gaye 🚫' if cmd == 'dlba2' else 'restart ho gaye ♻️'}", kb([[B("⬅️ Back", "rx")]]))
+
+    elif cmd in ("bn", "bnu"):
+        if cmd == "bnu":
+            vk = await asyncio.to_thread(db_vkey_by_hid, parts[1])
+            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            if vk:
+                await asyncio.to_thread(sql, "DELETE FROM banned WHERE vkey=?", (vk,))
+        total = await asyncio.to_thread(lambda: sql("SELECT COUNT(*) AS n FROM banned", (), "one")["n"])
+        pages = max(1, -(-total // RX_PAGE))
+        page = max(0, min(page, pages - 1))
+        rows_ = await asyncio.to_thread(
+            sql, "SELECT vkey, title FROM banned ORDER BY ts DESC LIMIT ? OFFSET ?", (RX_PAGE, page * RX_PAGE), "all"
+        )
+        lines = [f"{page * RX_PAGE + i}. {vlabel(x)}\n   {short(x['vkey'], 60)}" for i, x in enumerate(rows_, 1)]
+        text = f"🚫 Banned videos ({total})\n{LINE}\n" + ("\n".join(lines) if lines else "Koi banned video nahi.")
+        btn = [[B(f"✅ Unban {page * RX_PAGE + i}", f"bnu:{hid_of(x['vkey'])}:{page}")] for i, x in enumerate(rows_, 1)]
+        nav = nav_row("bn", page, pages)
+        if nav:
+            btn.append(nav)
+        btn.append([B("⬅️ Back", "rx")])
+        await show(update, text, kb(btn))
+
+
 # ------------------------------------------------------------------ admin: button dispatcher
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1933,6 +2311,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- refer
     elif cmd in ("rf", "rfe"):
         await admin_refer(update, context, cmd)
+
+    # ---- likes / dislikes / saved / repeat
+    elif cmd in ("rx", "rxr", "lk", "sv", "dl", "dlr", "dlb", "dlra", "dlba", "dlra2", "dlba2", "bn", "bnu"):
+        await admin_react(update, context, cmd, parts)
 
     # ---- domains / requests / status
     elif cmd in ("dm", "da", "dd", "dx"):
@@ -2046,6 +2428,9 @@ async def post_init(app: Application):
             web.post("/api/defaults", api_defaults),
             web.post("/api/resolve", api_resolve),
             web.get("/api/stream", api_stream),
+            web.post("/api/react", api_react),
+            web.post("/api/seen", api_seen),
+            web.post("/api/fav", api_fav),
         ]
     )
     app.bot_data["purge"] = asyncio.create_task(purge_loop())

@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<meta name="referrer" content="same-origin">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
@@ -327,10 +328,18 @@ const CATS = {
      the server plays them through /api/stream, which adds it. */
   const ratUrl = (page, title, dl) => API_BASE.replace(/\/$/, '') + '/api/stream?page=' + encodeURIComponent(page) + '&t=' + encodeURIComponent(token || '')
     + (dl ? '&dl=1&name=' + encodeURIComponent((title || 'video').replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'video') : '');
+  /* Render free has very little outbound bandwidth, so rat videos go straight from rat.xxx to the browser first.
+     Only when that does not work (file locked to the server IP / blocked) the server proxy is used. */
+  let directOK = (() => { try { return localStorage.getItem('direct') !== '0'; } catch (e) { return true; } })(), directFails = 0, directWorked = false;
+  function noteDirect(ok){
+    if (ok){ directWorked = true; directFails = 0; try { localStorage.setItem('direct', '1'); } catch (e) {} return; }
+    if (!directWorked && ++directFails >= 2){ directOK = false; try { localStorage.setItem('direct', '0'); } catch (e) {} toast('Seedha link band hai, server se chala raha hu'); }
+  }
+  const viaServer = u => /\/api\/stream\?/.test(u || '');
   async function streamFor(s, force){
     if (isRat(s)){
-      await api('/api/resolve', {page:s.page, force:!!force}, true);   // server finds + caches the real .mp4 url
-      s.url = ratUrl(s.page);
+      const r = await api('/api/resolve', {page:s.page, force:!!force}, true);   // server finds + caches the real .mp4 url
+      s.url = (directOK && !s.viaProxy) ? r.url : ratUrl(s.page);
       return s.url;
     }
     const f = s.page ? favs.find(x => x.page === s.page) : null, c = f || s;
@@ -370,8 +379,13 @@ const CATS = {
     const native = /\.(mp4|webm|mov)(\?|#|$)/i.test(url) || (isRat(STREAMS[my]) && !/\.m3u8/i.test(url));
     if (native){
       v.src = url;
-      v.addEventListener('loadedmetadata', () => play(v), {once:true});
-      v.addEventListener('error', () => { if (v.getAttribute('src') === url) retryOrFail(my, 'This video file cannot be played'); }, {once:true});
+      const direct = isRat(STREAMS[my]) && !viaServer(url);
+      v.addEventListener('loadedmetadata', () => { play(v); if (direct) noteDirect(true); }, {once:true});
+      v.addEventListener('error', () => {
+        if (v.getAttribute('src') !== url) return;
+        if (direct){ STREAMS[my].viaProxy = true; noteDirect(false); }   // direct link failed -> retry through the server
+        retryOrFail(my, 'This video file cannot be played');
+      }, {once:true});
       return;
     }
     if (window.Hls && Hls.isSupported()){
@@ -593,6 +607,7 @@ const CATS = {
     upstream_failed:'rat.xxx se file nahi aayi',
     upstream_403:'rat.xxx ne file block ki (403)',
     upstream_404:'File expire ho gayi, dobara try karo',
+    proxy_limit:'Is mahine ka server bandwidth khatam (Render free). Seedha link se try karo',
     bad_search:'Type a valid keyword (letters and numbers)',
     search_limit:'Too many new searches. Try again later',
     resolve_failed:'Could not get the video link. Try again',
@@ -703,14 +718,16 @@ const CATS = {
     toast('Download link la raha hu…');
     try {
       let url = await streamFor(s);
-      if (isRat(s)){
+      if (isRat(s) && directOK && !s.viaProxy && !viaServer(url)){
+        /* direct from rat.xxx: costs nothing on Render (the browser opens / saves the file) */
+      } else if (isRat(s)){
         /* check first (1 byte) so a failure is shown here instead of a broken download */
         let r; try { r = await fetch(ratUrl(s.page), {headers:{Range:'bytes=0-0'}}); } catch (e) { throw {code:'network'}; }
         if (!r.ok){ let j = {}; try { j = await r.json(); } catch (e) {} throw {code:j.error || ('http' + r.status)}; }
-        url = ratUrl(s.page, s.title, true);                           // proxy sends it as a file download
+        url = ratUrl(s.page, s.title, true);                           // server sends it as a file download
       } else if (/\.m3u8/i.test(url)){ toast('Ye HLS stream hai, direct download nahi ho sakta'); return; }
       const a = document.createElement('a');
-      a.href = url; if (!isRat(s)) a.target = '_blank'; a.rel = 'noopener'; a.download = '';
+      a.href = url; if (!viaServer(url)) a.target = '_blank'; a.rel = 'noopener noreferrer'; a.download = '';
       document.body.appendChild(a); a.click(); a.remove();
       toast('Download shuru ⬇️');
     } catch (e) {

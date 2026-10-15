@@ -43,3 +43,19 @@ rat.xxx par hotlink protection hai: .mp4 file ko `Referer: https://www.rat.xxx/`
 Isliye rat videos `/api/stream` se chalte aur download hote hain: server Referer laga ke file laata hai aur browser ko bhejta hai (seek / Range chalta hai).
 Search: `https://www.rat.xxx/search/?q=<keyword>&page=N`, video pages `/videos/...`. mp4 pehle page ke html se, na mile to yt-dlp se.
 Note: video ka data aapke server se guzarta hai, isliye Render ka bandwidth use hota hai.
+
+## Like / Dislike, dekhe hue videos, saved (admin ke liye)
+**Website (PIN ke baad):** video par neeche-right me 👍 Like, 👎 Dislike aur ⬇️ Download buttons. Dislike dabate hi agla video aata hai.
+- Liked video user ke feed me sabse upar, disliked sabse last me.
+- Jo video 3 sec se zyada dekha, wo server me save hota hai (`seen`) aur agle din dobara nahi aata. Liked video is rule se alag hai (wo upar aate rehte hain).
+- Saved (favorite) videos server me bhi save hote hain, taaki admin sab ke saved videos dekh sake.
+
+**Admin (Telegram) > 👍 Likes / 👎 Dislikes / 💾 Saved:**
+- 👍 Likes: kis video me kitne likes / dislikes / saves.
+- 💾 Saved: sab users ke saved videos (kitne users ne save kiya).
+- 👎 Dislikes: har video par ♻️ (phir se start: dislike hat jata hai) ya 🚫 (poora ban: kisi ko nahi dikhega). Sab ke liye bhi button hai.
+- 🚫 Banned: banned videos ki list, yahan se ✅ Unban.
+- ☑️ "Purane videos dobara dikhao" tick: ON = dekhe hue videos dobara aayenge, OFF = nahi aayenge.
+
+## Logs me Rat ke errors
+Render logs me `[rat_source] ERROR ...` (search 0 result / page nahi khula / mp4 nahi mila / anti-bot page) aur `RAT stream: ...` / `RAT resolve ...` (file ka HTTP status, 403 etc.) dikhte hain. Token logs me nahi aata.

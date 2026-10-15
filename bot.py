@@ -48,6 +48,8 @@ Web API
                                         src = "stream" (default) | "rat"      {items, reset, searching}
   POST /api/defaults              -> start videos (built-in + Web Start), shuffled
   POST /api/resolve  {page,force} -> fresh stream / file url for a saved page url (cached 1 hr)  {url, exp}
+  GET  /api/stream?page=&t=[&dl=1&name=] -> rat.xxx video through this server WITH the Referer header the site
+                                       needs (hotlink protection), Range / seeking supported
 
 SQLite tables (data.db)
   links(id, search, title, url, added, page)   UNIQUE(search, url)
@@ -71,6 +73,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+import aiohttp
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden, RetryAfter
@@ -150,6 +153,8 @@ BC_DELAY = 0.05  # pause between broadcast messages (~20 msg/s, Telegram allows 
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
+for _n in ("httpx", "httpcore", "aiohttp.access"):  # these INFO lines print the Telegram URL (BOT_TOKEN) / the stream url token
+    logging.getLogger(_n).setLevel(logging.WARNING)
 
 try:
     import link_file  # your fetch code, see link_file.py
@@ -818,10 +823,11 @@ async def api_resolve(request):
             if hit:
                 return web.json_response({"ok": True, "url": hit[0], "exp": int(hit[1] * 1000)})
         now = time.time()
-        RESOLVE_LOG[uid] = [t for t in RESOLVE_LOG.get(uid, []) if now - t < 3600]
-        if len(RESOLVE_LOG[uid]) >= MAX_RESOLVE:
-            return jerr(429, "resolve_limit")
-        RESOLVE_LOG[uid].append(now)
+        if mod is not rat_source:  # rat videos always play through the proxy = one resolve per video, no hourly cap
+            RESOLVE_LOG[uid] = [t for t in RESOLVE_LOG.get(uid, []) if now - t < 3600]
+            if len(RESOLVE_LOG[uid]) >= MAX_RESOLVE:
+                return jerr(429, "resolve_limit")
+            RESOLVE_LOG[uid].append(now)
         try:
             url = await asyncio.wait_for(asyncio.to_thread(mod.resolve_page, page), RESOLVE_TIMEOUT)
         except asyncio.TimeoutError:
@@ -834,6 +840,95 @@ async def api_resolve(request):
             return jerr(502, "resolve_failed")
         exp = await asyncio.to_thread(db_set_resolved, page, url)
     return web.json_response({"ok": True, "url": url, "exp": int(exp * 1000)})
+
+
+RAT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                             "Chrome/120.0.0.0 Safari/537.36"}
+PASS_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag")
+
+
+async def rat_file_url(page, force=False):
+    """Cached direct .mp4 url of a rat.xxx video page (same cache as /api/resolve)."""
+    async with RESOLVING.setdefault(page, asyncio.Lock()):
+        if not force:
+            hit = await asyncio.to_thread(db_get_resolved, page)
+            if hit:
+                return hit[0]
+        try:
+            url = await asyncio.wait_for(asyncio.to_thread(rat_source.resolve_page, page), RESOLVE_TIMEOUT)
+        except Exception:
+            log.warning("rat resolve failed: %s", page)
+            return None
+        if url:
+            await asyncio.to_thread(db_set_resolved, page, url)
+        return url
+
+
+async def api_stream(request):
+    """GET: plays / downloads a rat.xxx video. The browser cannot send the Referer header rat.xxx demands, so the
+    server fetches the file with it and passes the bytes (and Range requests) through. Auth = token in the url."""
+    if not rat_source:
+        return jerr(404, "no_rat")
+    hosts = {own_host(request), norm_host(request.headers.get("Referer", "")), norm_host(request.headers.get("Origin", ""))}
+    token = request.query.get("t", "")
+    if not any(h and check_token(token, h) for h in hosts):
+        return jerr(401, "bad_token")
+    page = request.query.get("page", "").strip()[:500]
+    if not rat_source.allowed_page(page):
+        return jerr(400, "bad_page")
+    dl = request.query.get("dl") == "1"
+    name = re.sub(r"[^\w\- ]+", "", request.query.get("name", "")).strip()[:60] or "video"
+
+    out = None
+    for attempt in (0, 1):  # 2nd try = file url expired, resolve again
+        url = await rat_file_url(page, force=bool(attempt))
+        if not url:
+            return jerr(502, "resolve_failed")
+        headers = dict(RAT_HEADERS, Referer=rat_source.REFERER)
+        if request.headers.get("Range"):
+            headers["Range"] = request.headers["Range"]
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=40))
+        try:
+            up = await session.get(url, headers=headers, allow_redirects=True)
+        except Exception:
+            await session.close()
+            if attempt:
+                return jerr(502, "upstream_failed")
+            continue
+        if up.status in (403, 404, 410) and not attempt:
+            up.release()
+            await session.close()
+            continue
+        if up.status >= 400:
+            up.release()
+            await session.close()
+            return jerr(502, "upstream_" + str(up.status))
+        out = (session, up)
+        break
+    if not out:
+        return jerr(502, "upstream_failed")
+    session, up = out
+    resp = web.StreamResponse(status=up.status)
+    for h in PASS_HEADERS:
+        if up.headers.get(h):
+            resp.headers[h] = up.headers[h]
+    if "Content-Type" not in resp.headers:
+        resp.content_type = "video/mp4"
+    resp.headers.setdefault("Accept-Ranges", "bytes")
+    resp.headers["Cache-Control"] = "private, max-age=3600"
+    if dl:
+        resp.headers["Content-Disposition"] = f'attachment; filename="{name}.mp4"'
+    try:
+        await resp.prepare(request)
+        async for chunk in up.content.iter_chunked(65536):
+            await resp.write(chunk)
+        await resp.write_eof()
+    except (ConnectionResetError, asyncio.CancelledError, aiohttp.ClientError):
+        pass  # the viewer closed / seeked: normal
+    finally:
+        up.release()
+        await session.close()
+    return resp
 
 
 async def api_defaults(request):
@@ -1950,6 +2045,7 @@ async def post_init(app: Application):
             web.post("/api/feed", api_feed),
             web.post("/api/defaults", api_defaults),
             web.post("/api/resolve", api_resolve),
+            web.get("/api/stream", api_stream),
         ]
     )
     app.bot_data["purge"] = asyncio.create_task(purge_loop())

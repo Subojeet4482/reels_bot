@@ -310,7 +310,16 @@ const CATS = {
     if (n < reels.length) setTimeout(() => { if (active === my) feed.scrollTo({top:n * feed.clientHeight, behavior:'smooth'}); }, 1500);
   }
   /* Favorites keep only the video PAGE url. The stream url is fetched when you play and kept for 1 hour. */
+  /* rat.xxx files are hotlink-protected (they need a Referer header the browser cannot send):
+     the server plays them through /api/stream, which adds it. */
+  const ratUrl = (page, title, dl) => API_BASE.replace(/\/$/, '') + '/api/stream?page=' + encodeURIComponent(page) + '&t=' + encodeURIComponent(token || '')
+    + (dl ? '&dl=1&name=' + encodeURIComponent((title || 'video').replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'video') : '');
   async function streamFor(s, force){
+    if (isRat(s)){
+      await api('/api/resolve', {page:s.page, force:!!force}, true);   // server finds + caches the real .mp4 url
+      s.url = ratUrl(s.page);
+      return s.url;
+    }
     const f = s.page ? favs.find(x => x.page === s.page) : null, c = f || s;
     if (!force && c.s && c.e > Date.now() + 60000) return c.s;       // still valid (1 hr)
     const r = await api('/api/resolve', {page:s.page, force:!!force}, true);
@@ -320,7 +329,7 @@ const CATS = {
   }
   async function startItem(i, force){
     const s = STREAMS[i]; if (!s) return;
-    let url = s.url;
+    let url = isRat(s) ? '' : s.url;      // rat: always go through the Referer proxy, never the raw hotlink-blocked file url
     if (s.page && (force || !url)){
       $('spinner').classList.add('on');
       try { url = await streamFor(s, force); }
@@ -640,10 +649,11 @@ const CATS = {
     const s = STREAMS[active]; if (!s) return;
     toast('Download link la raha hu…');
     try {
-      const url = await streamFor(s);
-      if (/\.m3u8/i.test(url)){ toast('Ye HLS stream hai, direct download nahi ho sakta'); return; }
+      let url = await streamFor(s);
+      if (isRat(s)) url = ratUrl(s.page, s.title, true);              // proxy sends it as a file download
+      else if (/\.m3u8/i.test(url)){ toast('Ye HLS stream hai, direct download nahi ho sakta'); return; }
       const a = document.createElement('a');
-      a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      a.href = url; if (!isRat(s)) a.target = '_blank'; a.rel = 'noopener';
       a.download = ((s.title || 'video').replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'video') + '.mp4';
       document.body.appendChild(a); a.click(); a.remove();
       toast('Download shuru');

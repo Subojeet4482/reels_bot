@@ -77,6 +77,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .rb:active .c{transform:scale(.88)}
 #srcBtn.rat .c{color:var(--accent);border-color:var(--accent)}
 #dlBtn .c{color:#4be38a;border-color:#4be38a}
+#react{position:absolute;z-index:2;right:calc(14px + var(--sr));bottom:calc(128px + var(--sb));display:flex;flex-direction:column;gap:14px;align-items:center}
+#likeBtn.on .c{color:#4be38a;border-color:#4be38a;background:rgba(75,227,138,.18)}
+#dislikeBtn.on .c{color:#ff5a6e;border-color:#ff5a6e;background:rgba(255,90,110,.18)}
+#likeBtn.on svg,#dislikeBtn.on svg{fill:currentColor}
+#likeBtn.pop,#dislikeBtn.pop{animation:pop .3s}
 
 
 /* Seek bar: thin by default, grows while dragging or paused */
@@ -161,6 +166,8 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
   <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4V3z"/></symbol>
   <symbol id="i-swap" viewBox="0 0 24 24"><path d="M17 3l4 4-4 4M21 7H8M7 21l-4-4 4-4M3 17h13"/></symbol>
   <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 21h16"/></symbol>
+  <symbol id="i-like" viewBox="0 0 24 24"><path d="M7 11v9H3v-9h4zM7 11l4-8c1.7 0 2.5 1.2 2.2 2.8L12.6 9H19a2 2 0 0 1 2 2.3l-1.2 7A2 2 0 0 1 17.8 20H7"/></symbol>
+  <symbol id="i-dislike" viewBox="0 0 24 24"><path d="M17 13V4h4v9h-4zM17 13l-4 8c-1.7 0-2.5-1.2-2.2-2.8L11.4 15H5a2 2 0 0 1-2-2.3l1.2-7A2 2 0 0 1 6.2 4H17"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 10v7M14 10v7"/></symbol>
 </svg>
 
@@ -194,12 +201,17 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     </div>
 
 
+    <div id="react">
+      <button class="rb" id="likeBtn" aria-label="Like" aria-pressed="false" hidden><span class="c"><svg class="i"><use href="#i-like"/></svg></span>Like</button>
+      <button class="rb" id="dislikeBtn" aria-label="Dislike" aria-pressed="false" hidden><span class="c"><svg class="i"><use href="#i-dislike"/></svg></span>Dislike</button>
+      <button class="rb" id="dlBtn" aria-label="Download video" hidden><span class="c"><svg class="i"><use href="#i-download"/></svg></span>Download</button>
+    </div>
+
     <div id="rail">
       <button class="rb" id="muteBtn" aria-label="Sound"><span class="c"><svg class="i" id="muteIcon"><use href="#i-mute"/></svg></span>Sound</button>
       <button class="rb" id="rotateBtn" aria-label="Landscape"><span class="c"><svg class="i" id="rotIcon"><use href="#i-rotate"/></svg></span><span id="rotLabel">Rotate</span></button>
       <button class="rb" id="favsBtn" aria-label="Open favorites" hidden><span class="c"><svg class="i"><use href="#i-bookmark"/></svg><b class="badge" id="favBadge" hidden>0</b></span>Favs</button>
       <button class="rb" id="srcBtn" aria-label="Switch source" hidden><span class="c"><svg class="i"><use href="#i-swap"/></svg></span><span id="srcLabel">Stream</span></button>
-      <button class="rb" id="dlBtn" aria-label="Download video" hidden><span class="c"><svg class="i"><use href="#i-download"/></svg></span>Download</button>
     </div>
     <div id="scrub" aria-label="Seek">
       <div class="stime"><span id="tCur">0:00</span> / <span id="tDur">0:00</span></div>
@@ -256,6 +268,7 @@ const CATS = {
 
 (() => {
   let STREAMS = [];
+  let mode = 'default', token = null;   // declared early: updateFavUI() / ratUrl() use them
   const $ = id => document.getElementById(id);
   const app = $('app'), feed = $('feed'), menu = $('menu');
   const icon = (el, n) => el.firstElementChild.setAttribute('href', '#i-' + n);
@@ -299,7 +312,7 @@ const CATS = {
     active = i;
     reels[i].classList.remove('off'); scrub.classList.remove('open');
     if (i >= STREAMS.length - 2) loadMore();
-    $('brand').textContent = STREAMS[i].title || ''; updateFavUI();
+    $('brand').textContent = STREAMS[i].title || ''; updateFavUI(); markSeen(i);
     startItem(i);
   }
   function play(v){ const p = v.play(); if (p && p.catch) p.catch(() => toast('Tap to play')); }
@@ -439,6 +452,36 @@ const CATS = {
   const fk = x => x.page || x.url || '';
   const favLabel = f => { if (f.title) return f.title; const k = fk(f); try { const u = new URL(k); return (u.host + u.pathname).slice(0, 60); } catch (e) { return k.slice(0, 60); } };
   const isFav = key => favs.some(f => fk(f) === key);
+  /* ---------- Like / Dislike / watched (saved on the server, per user) ---------- */
+  let marks = {};
+  try { marks = JSON.parse(localStorage.getItem('marks') || '{}') || {}; } catch (e) {}
+  const markOf = s => (s.mark !== undefined ? s.mark : (marks[s.page || s.url] || 0));
+  function setMark(s, v){
+    s.mark = v; const k = s.page || s.url;
+    if (v) marks[k] = v; else delete marks[k];
+    try { localStorage.setItem('marks', JSON.stringify(marks)); } catch (e) {}
+  }
+  function react(v){
+    const s = STREAMS[active]; if (!s || mode !== 'secret') return;
+    const nv = markOf(s) === v ? 0 : v;
+    setMark(s, nv); updateFavUI();
+    const b = $(v === 1 ? 'likeBtn' : 'dislikeBtn'); b.classList.remove('pop'); void b.offsetWidth; b.classList.add('pop');
+    toast(nv === 1 ? 'Liked 👍 (ye video upar aayega)' : nv === -1 ? 'Disliked 👎 (ye last me jayega)' : 'Reaction hata diya');
+    api('/api/react', {page:s.page || '', url:s.page ? '' : s.url, title:s.title || '', val:nv}, true).catch(e => { if (e.code === 'bad_token') exitSecret(); });
+    if (nv === -1){ const my = active; setTimeout(() => { if (active === my && my + 1 < reels.length) feed.scrollTo({top:(my + 1) * feed.clientHeight, behavior:'smooth'}); }, 700); }
+  }
+  $('likeBtn').onclick = () => react(1);
+  $('dislikeBtn').onclick = () => react(-1);
+  function markSeen(i){                 // watched for 3+ seconds -> server will not send it again (unless admin allows)
+    setTimeout(() => {
+      const s = STREAMS[i]; if (active !== i || !s || mode !== 'secret' || s.seenSent) return;
+      s.seenSent = true;
+      api('/api/seen', {items:[{page:s.page || '', url:s.page ? '' : s.url}]}, true).catch(() => {});
+    }, 3000);
+  }
+  const favItem = f => ({page:f.page || '', url:f.page ? '' : (f.url || ''), title:f.title || ''});
+  function syncFavs(items, on){ if (mode === 'secret' && items.length) api('/api/fav', {items:items.map(favItem), on}, true).catch(() => {}); }
+
   function saveFavs(){ memFavs = favs; try { localStorage.setItem('favs', JSON.stringify(favs)); } catch (e) {} updateFavUI(); }
   function updateFavUI(){
     const s = STREAMS[active], on = !!(s && isFav(fk(s))), b = $('favBtn');
@@ -446,16 +489,21 @@ const CATS = {
     b.setAttribute('aria-label', on ? 'Remove from favorites' : 'Add to favorites');
     $('favIcon').classList.toggle('fill', on);
     $('favBadge').textContent = favs.length; $('favBadge').hidden = !favs.length;
-    $('dlBtn').hidden = !(s && isRat(s));
+    const ok = !!(s && mode === 'secret');
+    $('dlBtn').hidden = $('likeBtn').hidden = $('dislikeBtn').hidden = !ok;
+    const m = s ? markOf(s) : 0;
+    $('likeBtn').classList.toggle('on', m === 1); $('likeBtn').setAttribute('aria-pressed', m === 1);
+    $('dislikeBtn').classList.toggle('on', m === -1); $('dislikeBtn').setAttribute('aria-pressed', m === -1);
     $('favCount').textContent = favs.length + '/' + FAV_MAX;
   }
   $('favBtn').onclick = () => {
     const s = STREAMS[active]; if (!s){ toast('Nothing to save yet'); return; }
     const i = favs.findIndex(f => fk(f) === fk(s));
-    if (i >= 0){ favs.splice(i, 1); toast('Removed from favorites'); }
+    if (i >= 0){ syncFavs([favs[i]], false); favs.splice(i, 1); toast('Removed from favorites'); }
     else {
       if (favs.length >= FAV_MAX){ toast('Favorites full (' + FAV_MAX + '/' + FAV_MAX + '). Remove one first'); return; }
       favs.push(s.page ? {page:s.page, title:s.title || '', cat:s.cat || ''} : {url:s.url, title:s.title || '', cat:s.cat || ''});   // page url only, no stream url
+      syncFavs([favs[favs.length - 1]], true);
       toast('Saved to favorites (' + favs.length + '/' + FAV_MAX + ')');
     }
     saveFavs();
@@ -517,7 +565,7 @@ const CATS = {
   menu.onclick = e => { const li = e.target.closest('li'); if (!li) return; closeMenu(); selectCat(li.dataset.cat); };
 
   /* ---------- Backend ---------- */
-  let mode = 'default', token = null, filter = START_CAT, seen = new Set(), more = false, exhausted = false;
+  let filter = START_CAT, seen = new Set(), more = false, exhausted = false;
   const shuffle = a => { for (let i = a.length - 1; i > 0; i--){ const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 
   async function api(path, body, auth){
@@ -541,6 +589,10 @@ const CATS = {
     unknown_user:'Account not found. Create a new PIN',
     rate_limited:'Too many tries. Wait 5 minutes',
     bad_token:'Session expired. Enter the PIN again',
+    resolve_failed:'Video ka link nahi mila (server logs dekho)',
+    upstream_failed:'rat.xxx se file nahi aayi',
+    upstream_403:'rat.xxx ne file block ki (403)',
+    upstream_404:'File expire ho gayi, dobara try karo',
     bad_search:'Type a valid keyword (letters and numbers)',
     search_limit:'Too many new searches. Try again later',
     resolve_failed:'Could not get the video link. Try again',
@@ -629,6 +681,7 @@ const CATS = {
   function enterSecret(){
     mode = 'secret';
     $('menuWrap').hidden = false; $('srcBtn').hidden = false; $('searchBtn').hidden = false; $('favBtn').hidden = false; $('favsBtn').hidden = false; $('keyBtn').classList.add('on'); $('keyBtn').setAttribute('aria-label', 'Back to default');
+    syncFavs(favs.slice(), true);
     selectCat(START_CAT);
   }
   function exitSecret(){
@@ -650,16 +703,19 @@ const CATS = {
     toast('Download link la raha hu…');
     try {
       let url = await streamFor(s);
-      if (isRat(s)) url = ratUrl(s.page, s.title, true);              // proxy sends it as a file download
-      else if (/\.m3u8/i.test(url)){ toast('Ye HLS stream hai, direct download nahi ho sakta'); return; }
+      if (isRat(s)){
+        /* check first (1 byte) so a failure is shown here instead of a broken download */
+        let r; try { r = await fetch(ratUrl(s.page), {headers:{Range:'bytes=0-0'}}); } catch (e) { throw {code:'network'}; }
+        if (!r.ok){ let j = {}; try { j = await r.json(); } catch (e) {} throw {code:j.error || ('http' + r.status)}; }
+        url = ratUrl(s.page, s.title, true);                           // proxy sends it as a file download
+      } else if (/\.m3u8/i.test(url)){ toast('Ye HLS stream hai, direct download nahi ho sakta'); return; }
       const a = document.createElement('a');
-      a.href = url; if (!isRat(s)) a.target = '_blank'; a.rel = 'noopener';
-      a.download = ((s.title || 'video').replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'video') + '.mp4';
+      a.href = url; if (!isRat(s)) a.target = '_blank'; a.rel = 'noopener'; a.download = '';
       document.body.appendChild(a); a.click(); a.remove();
-      toast('Download shuru');
+      toast('Download shuru ⬇️');
     } catch (e) {
       if (e.code === 'bad_token'){ exitSecret(); fail(e); }
-      else toast(ERR[e.code] || 'Download link nahi mila');
+      else toast('Download nahi hua: ' + (ERR[e.code] || e.code || 'link nahi mila'));
     }
   };
   $('dlBtn').onclick = doDownload;

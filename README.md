@@ -63,3 +63,10 @@ Render logs me `[rat_source] ERROR ...` (search 0 result / page nahi khula / mp4
 ## Video ki length kaise pata chalti hai (Rat)
 1) search card, 2) video page ka meta / JSON-LD / "Duration" (ab ye pehle chalta hai), 3) file size (HEAD / Range request). 
 Teeno na mile to `rat_source.py` me `KEEP_UNKNOWN = True` hone par video phir bhi save hota hai (log me "length unknown, kept anyway"); `False` karoge to skip hoga.
+
+## Render free aur bandwidth
+Render free par mahine ka outbound bandwidth bahut kam hai (docs ke hisaab se 5 GB; purane sources 100 GB likhte hain, apne dashboard ka "Outbound Bandwidth" graph dekho).
+Isliye Rat videos pehle SEEDHE rat.xxx se browser me chalte / download hote hain (server se kuch nahi guzarta).
+Seedha na chale (file server IP se locked / block) to browser khud server proxy (/api/stream) par aa jata hai aur yaad rakhta hai (2 fail ke baad seedha proxy).
+Proxy ka data count hota hai; `PROXY_MAX_MB` (default 3000) ke baad proxy band, taaki free service suspend / bill na ho. Admin > Status me "Server se gaya video data" dikhta hai.
+Seedha link dobara try karwana ho to browser me site data clear karo (localStorage `direct`).

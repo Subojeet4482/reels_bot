@@ -21,6 +21,7 @@ Page url format that is saved in `links.page`:
 import html as htmllib
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -97,6 +98,26 @@ def is_long(duration=None, size=None):
 
 def log(*a):
     print("[rat_source]", *a, flush=True)
+
+
+def err(*a):
+    """Errors show in the Render logs as '[rat_source] ERROR ...' so they are easy to find."""
+    print("[rat_source] ERROR", *a, flush=True)
+
+
+def why(e):
+    """Short readable reason for an exception (HTTP code, timeout, ...)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code} {e.reason}"
+    return f"{type(e).__name__}: {str(e)[:100]}"
+
+
+BLOCK_WORDS = ("just a moment", "cf-chl", "captcha", "access denied", "attention required", "verify you are human")
+
+
+def blocked_hint(html):
+    h = (html or "")[:6000].lower()
+    return next((w for w in BLOCK_WORDS if w in h), "")
 
 
 def fetch(url, timeout=15):
@@ -189,10 +210,14 @@ def result_pages(plus, deadline, pages=PAGES):
             try:
                 html, final, _ = fetch(url)
             except Exception as e:
-                log("search failed:", url, str(e)[:80])
+                err("search request failed:", url, "->", why(e))
                 break
             items = parse_results(html, final)
             log(f"{url} -> {len(items)} results")
+            if not items:
+                hint = blocked_hint(html)
+                err(f"search gave 0 videos: {url} (page size {len(html)} bytes"
+                    + (f", looks like an anti-bot / block page: '{hint}'" if hint else ", no /videos/ links in the html") + ")")
             if not items:
                 break
             sig = {i[1] for i in items[:5]}
@@ -251,7 +276,7 @@ def mp4_from_ytdlp(page_url):
             u = info["formats"][-1].get("url")
         return u
     except Exception as e:
-        log("yt-dlp failed", str(e)[:80])
+        err("yt-dlp failed:", page_url, "->", str(e)[:160])
         return None
 
 
@@ -259,18 +284,20 @@ def resolve_page(page_url):
     """Video page url -> direct .mp4 url (None if nothing found). Fast html patterns first, yt-dlp as fallback."""
     if not allowed_page(page_url):
         return None
-    url = None
+    url, html = None, ""
     try:
         html, final, ct = fetch(page_url)
         if not html:  # the url redirected straight to the file
             return final
         url = mp4_from_html(htmllib.unescape(html)) or pick_file(html, final)
     except Exception as e:
-        log("resolve failed", page_url, str(e)[:80])
+        err("video page request failed:", page_url, "->", why(e))
+        html = ""
     if not url:
         url = mp4_from_ytdlp(page_url)
     if not url:
-        log("no file url found on", page_url)
+        hint = blocked_hint(html)
+        err("no .mp4 url found on", page_url, f"(html {len(html)} bytes" + (f", block page: '{hint}'" if hint else "") + ", yt-dlp also found nothing)")
     return url
 
 
@@ -306,9 +333,13 @@ def on_search(keyword):
             continue
         if dur is None:
             size = None if re.search(r"\.m3u8", url, re.I) else file_size(url)
+            if size is None:
+                err("cannot read the file size (needed to know if it is long):", page)
             if not is_long(size=size):  # too short, or cannot prove it is long
                 skipped += 1
                 continue
         saved += link_file.save_links(key, [(title, url, page)])
         time.sleep(0.3)
     log(f"{key}: tried {tried}, saved {saved}, skipped {skipped} (not long)")
+    if saved == 0:
+        err(f"{key}: 0 videos saved (tried {tried}, skipped {skipped} not long). Look at the ERROR lines above for the reason.")

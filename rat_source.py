@@ -301,8 +301,19 @@ def mp4_from_html(html):
     return None
 
 
+def url_ok(url):
+    """True if the file answers (HTTP 200/206) when asked WITH the Referer. Returns (ok, reason)."""
+    try:
+        req = urllib.request.Request(url, headers={**HEADERS, "Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.status in (200, 206), f"HTTP {r.status}"
+    except Exception as e:
+        return False, why(e)
+
+
 def mp4_from_ytdlp(page_url):
-    """Fallback when the page html has no mp4 url."""
+    """yt-dlp knows the KVS 'function/0/...' hash trick, so its url is the one that really plays.
+    Returns (url or None, duration or None)."""
     try:
         import yt_dlp
         with yt_dlp.YoutubeDL({"format": "best", "quiet": True, "no_warnings": True, "skip_download": True,
@@ -311,14 +322,17 @@ def mp4_from_ytdlp(page_url):
         u = info.get("url")
         if not u and info.get("formats"):
             u = info["formats"][-1].get("url")
-        return u
+        d = info.get("duration")
+        return u, (int(d) if d else None)
     except Exception as e:
         err("yt-dlp failed:", page_url, "->", str(e)[:160])
-        return None
+        return None, None
 
 
 def resolve_info(page_url):
-    """Video page url -> (direct .mp4 url or None, duration in seconds or None)."""
+    """Video page url -> (direct .mp4 url or None, duration in seconds or None).
+    1) mp4 url from the page html, but ONLY if the file really answers (KVS 'function/0/' links are scrambled and
+       give 404 until they are decoded)   2) yt-dlp (decodes them)."""
     if not allowed_page(page_url):
         return None, None
     url, html, dur = None, "", None
@@ -329,13 +343,24 @@ def resolve_info(page_url):
         html = htmllib.unescape(html)
         dur = duration_from_html(html)
         url = mp4_from_html(html) or pick_file(html, final)
+        if url:
+            ok, why_ = url_ok(url)
+            if not ok:
+                err(f"mp4 url from the page does not play ({why_}), trying yt-dlp:", url.split("?")[0][:110],
+                    "(scrambled 'function/0/' link)" if "function/0/" in html else "")
+                url = None
     except Exception as e:
         err("video page request failed:", page_url, "->", why(e))
     if not url:
-        url = mp4_from_ytdlp(page_url)
+        url, ydur = mp4_from_ytdlp(page_url)
+        dur = dur or ydur
+        if url:
+            ok, why_ = url_ok(url)
+            if not ok:
+                err(f"yt-dlp url does not play either ({why_}):", url.split("?")[0][:110])
     if not url:
         hint = blocked_hint(html)
-        err("no .mp4 url found on", page_url, f"(html {len(html)} bytes" + (f", block page: '{hint}'" if hint else "") + ", yt-dlp also found nothing)")
+        err("no playable .mp4 url for", page_url, f"(html {len(html)} bytes" + (f", block page: '{hint}'" if hint else "") + ")")
     return url, dur
 
 
